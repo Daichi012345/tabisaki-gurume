@@ -1,0 +1,99 @@
+name: tabisaki-gurmeguri
+
+services:
+  api:
+    container_name: gurmeguri-api
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    # 例: backend/Dockerfile は node:20-alpine ベース推奨
+    env_file:
+      - ./backend/.env   # 下の .env 例を参考に
+    environment:
+      - NODE_ENV=production
+      - TZ=Asia/Tokyo
+      # 依存サービス接続情報（.env 内の値で上書き可）
+      - DATABASE_URL=postgresql://appuser:apppass@db:5432/gurmeguri
+      - REDIS_URL=redis://redis:6379/0
+      # CORSなど（フロントのURLに合わせて調整）
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:3000
+    ports:
+      - "8080:8080"   # API ポート（Express 等）
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - appnet
+
+  db:
+    container_name: gurmeguri-db
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=gurmeguri
+      - POSTGRES_USER=appuser
+      - POSTGRES_PASSWORD=apppass
+      - TZ=Asia/Tokyo
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    ports:
+      - "5432:5432"   # ローカルから直接つなぐ場合のみ公開
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d gurmeguri"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - appnet
+
+  redis:
+    container_name: gurmeguri-redis
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "6379:6379"  # 開発時のみ公開
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - appnet
+
+  # 任意: DBをGUIで触りたい場合は pgAdmin を使う
+  pgadmin:
+    container_name: gurmeguri-pgadmin
+    image: dpage/pgadmin4:8
+    profiles: ["devtools"]   # 本番では起動しない（`--profile devtools`で起動）
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@example.com
+      - PGADMIN_DEFAULT_PASSWORD=adminpass
+      - TZ=Asia/Tokyo
+    ports:
+      - "5050:80"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - appnet
+
+networks:
+  appnet:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:

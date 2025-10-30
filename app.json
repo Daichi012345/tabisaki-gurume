@@ -13,14 +13,30 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "このアプリは現在地を表示するために位置情報を使用します。"
+      },
+      "config": {
+        "googleMapsApiKey": "AIzaSyAWBW7-tumNw4ixpKY8w6rbVK6RpUnlKF4"
+      }
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION"
+      ],
+      "config": {
+        "googleMaps": {
+          "apiKey": "AIzaSyAWBW7-tumNw4ixpKY8w6rbVK6RpUnlKF4"
+        }
+      },
+      "package": "com.hayashidaichi.tabisakigurume"
     },
     "web": {
       "favicon": "./assets/favicon.png"
