@@ -18,7 +18,7 @@
         "NSLocationWhenInUseUsageDescription": "このアプリは現在地を表示するために位置情報を使用します。"
       },
       "config": {
-        "googleMapsApiKey": "AIzaSyAWBW7-tumNw4ixpKY8w6rbVK6RpUnlKF4"
+        "googleMapsApiKey": ""
       }
     },
     "android": {
@@ -33,7 +33,7 @@
       ],
       "config": {
         "googleMaps": {
-          "apiKey": "AIzaSyAWBW7-tumNw4ixpKY8w6rbVK6RpUnlKF4"
+          "apiKey": ""
         }
       },
       "package": "com.hayashidaichi.tabisakigurume"
