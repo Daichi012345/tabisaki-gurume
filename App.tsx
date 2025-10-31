@@ -54,7 +54,7 @@ export default function App(): React.ReactElement {
   return (
     <AuthProvider>
       <SafeAreaProvider>
-        <SafeAreaView style={{ flex: 1 }}>
+        <SafeAreaView style={{ flex: 1 }} edges={['left','right','bottom']}>
           <AppContent />
         </SafeAreaView>
       </SafeAreaProvider>

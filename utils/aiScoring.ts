@@ -38,7 +38,8 @@ export interface SpotScore {
 }
 
 // ご当地グルメキーワード（都道府県別）
-const LOCAL_SPECIALTIES_KEYWORDS: { [key: string]: string[] } = {
+// 他モジュールからも参照できるように export
+export const LOCAL_SPECIALTIES_KEYWORDS: { [key: string]: string[] } = {
   '北海道': ['札幌ラーメン', '海鮮丼', 'ジンギスカン', '白い恋人', 'スープカレー', '毛ガニ', '帯広豚丼'],
   '青森県': ['りんご', '大間マグロ', 'せんべい汁', 'りんごパイ', 'ホタテ'],
   '岩手県': ['わんこそば', '冷麺', '前沢牛', 'じゃじゃ麺', '南部せんべい'],

@@ -1,32 +1,3 @@
-// カテゴリ別の雰囲気画像（UnsplashのSourceエンドポイントを使用）
-// 著名タグでなるべく店舗の“感じ”が伝わる写真を取得
-const getCategoryFallbackImage = (place: { name: string; address?: string; }): string => {
-  const text = `${place.name} ${place.address || ''}`;
-  const entries: Array<{ match: RegExp; query: string }> = [
-  { match: /(ラーメン|ramen)/i, query: 'ramen,restaurant' },
-  { match: /(寿司|鮨|sushi)/i, query: 'sushi,restaurant' },
-  { match: /(焼肉|yakiniku|bbq)/i, query: 'barbecue,grill,restaurant' },
-  { match: /(カレー|curry)/i, query: 'curry,restaurant' },
-  { match: /(うどん|そば|蕎麦|udon|soba|noodle)/i, query: 'noodles,restaurant' },
-  { match: /(天ぷら|天婦羅|tempura)/i, query: 'tempura,restaurant' },
-  { match: /(居酒屋|izakaya)/i, query: 'izakaya,japanese,bar' },
-  { match: /(和食|japanese)/i, query: 'japanese,restaurant' },
-  { match: /(イタリアン|イタリア料理|italian|pizza|pasta)/i, query: 'italian,restaurant' },
-  { match: /(フレンチ|フランス料理|french)/i, query: 'french,restaurant' },
-  { match: /(中華|中国料理|chinese|餃子)/i, query: 'chinese,restaurant' },
-  { match: /(焼鳥|焼き鳥|yakitori)/i, query: 'yakitori,grill,restaurant' },
-  { match: /(カフェ|cafe|coffee)/i, query: 'cafe,coffee' },
-  { match: /(バー|bar|pub)/i, query: 'bar,pub' },
-  ];
-  for (const e of entries) {
-  if (e.match.test(text)) {
-  return `https://source.unsplash.com/600x400/?${encodeURIComponent(e.query)}`;
-    }
-  }
-  // 総合的な外観/内装の写真を狙う
-  return 'https://source.unsplash.com/600x400/?restaurant,interior';
-};
-
 // プレースホルダーはURLでは返さず、UIで表示を切り替える（空文字）
 const getPlaceholderImage = (): string => '';
 import React, { useState, useEffect } from 'react';
@@ -135,7 +106,7 @@ const resolvePlaceIdByNameAndLocation = async (
   }
 };
 
-// 最良の写真URLを決める（v1 by id -> v1 resolve id -> カテゴリ雰囲気写真 -> Static Map -> 画像なし）
+// 最良の写真URLを決める（v1 by id -> v1 resolve id -> Static Map -> 画像なし）
 const getBestPhotoUrl = async (
   place: { id: string; name: string; address?: string; lat?: number; lng?: number }
 ): Promise<string> => {
@@ -156,10 +127,6 @@ const getBestPhotoUrl = async (
     }
   }
 
-  // さらにフォールバック: カテゴリベースの雰囲気写真
-  const vibe = getCategoryFallbackImage({ name: place.name, address: place.address });
-  if (vibe) return vibe;
-
   // さらにフォールバック: Static Map
   if (GOOGLE_API_KEY) {
     if (typeof place.lat === 'number' && typeof place.lng === 'number') {
@@ -167,23 +134,13 @@ const getBestPhotoUrl = async (
       return `https://maps.googleapis.com/maps/api/staticmap?center=${place.lat},${place.lng}&zoom=17&size=300x200&maptype=roadmap&markers=color:red%7C${place.lat},${place.lng}&key=${GOOGLE_API_KEY}`;
     }
     // console.log('photo source: static map by name', place.name);
-    return getSimplePhotoUrl(place.name);
+    return `https://maps.googleapis.com/maps/api/staticmap?center=${encodeURIComponent(place.name)}&zoom=17&size=300x200&maptype=roadmap&markers=color:red%7C${encodeURIComponent(place.name)}&key=${GOOGLE_API_KEY}`;
   }
 
   // 最終: 空（UI側で「画像なし」を表示）
   return '';
 };
 
-// シンプルな写真URL生成（Static Maps API使用）
-const getSimplePhotoUrl = (placeName: string): string => {
-  if (!GOOGLE_API_KEY) {
-    return getPlaceholderImage();
-  }
-  
-  return `https://maps.googleapis.com/maps/api/staticmap?center=${encodeURIComponent(placeName)}&zoom=17&size=300x200&maptype=roadmap&markers=color:red%7C${encodeURIComponent(placeName)}&key=${GOOGLE_API_KEY}`;
-};
-
-resolvePlaceIdByNameAndLocation// （重複定義削除）
 
 interface AIRankingModalProps {
   visible: boolean;
@@ -214,6 +171,12 @@ const AIRankingModal: React.FC<AIRankingModalProps> = ({
       for (const score of scores) {
         const cacheKey = score.place.id;
         if (!photoUrls[cacheKey]) {
+          // 先に place に既に photoUrl がある場合はそれを使う（Places:searchTextで取得済みの最短ルート）
+          const preset = (score.place as any).photoUrl as string | undefined;
+          if (preset) {
+            newPhotoUrls[cacheKey] = preset;
+            continue;
+          }
           try {
             // v1 -> 旧API -> StaticMap の順で最適な写真URLを取得
             const photoUrl = await getBestPhotoUrl({
@@ -293,14 +256,14 @@ const AIRankingModal: React.FC<AIRankingModalProps> = ({
               style={styles.spotPhoto}
               resizeMode="cover"
               onError={() => {
-                // 読み込み失敗時は雰囲気画像→StaticMapの順で再設定
-                const vibeUrl = getCategoryFallbackImage({ name: item.place.name, address: item.place.address });
-                if (vibeUrl) {
-                  setPhotoUrls(prev => ({ ...prev, [item.place.id]: vibeUrl }));
-                } else if (typeof (item.place as any).lat === 'number' && typeof (item.place as any).lng === 'number' && GOOGLE_API_KEY) {
+                // 読み込み失敗時は StaticMap（Google）にフォールバック
+                if (typeof (item.place as any).lat === 'number' && typeof (item.place as any).lng === 'number' && GOOGLE_API_KEY) {
                   const { lat, lng } = (item.place as any);
                   const mapUrl = `https://maps.googleapis.com/maps/api/staticmap?center=${lat},${lng}&zoom=17&size=300x200&maptype=roadmap&markers=color:red%7C${lat},${lng}&key=${GOOGLE_API_KEY}`;
                   setPhotoUrls(prev => ({ ...prev, [item.place.id]: mapUrl }));
+                } else if (GOOGLE_API_KEY) {
+                  const mapUrlByName = `https://maps.googleapis.com/maps/api/staticmap?center=${encodeURIComponent(item.place.name)}&zoom=17&size=300x200&maptype=roadmap&markers=color:red%7C${encodeURIComponent(item.place.name)}&key=${GOOGLE_API_KEY}`;
+                  setPhotoUrls(prev => ({ ...prev, [item.place.id]: mapUrlByName }));
                 } else {
                   // 最終的に削除して「画像なし」表示へ
                   setPhotoUrls(prev => {

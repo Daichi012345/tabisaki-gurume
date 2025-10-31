@@ -7,11 +7,11 @@ import {
   Alert, 
   ScrollView,
   ActivityIndicator,
-  SafeAreaView,
   Modal
 } from 'react-native';
 import * as Location from 'expo-location';
 import AIRankingModal from './AIRankingModal';
+import { LOCAL_SPECIALTIES_KEYWORDS } from '../utils/aiScoring';
 import { calculateAIScore, SpotScore } from '../utils/aiScoring';
 import { ensureGoogleApiKey } from '../utils/config';
 import { useAuth } from '../utils/auth';
@@ -25,12 +25,14 @@ type Place = {
   name: string;
   lat: number;
   lng: number;
+  address?: string;
   vicinity?: string;
   rating?: number;
   user_ratings_total?: number;
   price_level?: number;
   types?: string[];
   reasons?: string[];
+  photoUrl?: string;
 };
 
 type UserPreferences = {
@@ -97,7 +99,7 @@ async function searchPlaces(query: string, lat: number, lng: number): Promise<Pl
     headers: {
       'Content-Type': 'application/json',
       'X-Goog-Api-Key': API_KEY,
-      'X-Goog-FieldMask': 'places.id,places.name,places.displayName,places.location,places.rating,places.userRatingCount,places.priceLevel,places.types,places.formattedAddress'
+      'X-Goog-FieldMask': 'places.id,places.name,places.displayName,places.location,places.rating,places.userRatingCount,places.priceLevel,places.types,places.formattedAddress,places.photos'
     },
     body: JSON.stringify({
       textQuery: query,
@@ -112,17 +114,24 @@ async function searchPlaces(query: string, lat: number, lng: number): Promise<Pl
   });
 
   const json = await res.json();
-  return json.places?.map((place: any) => ({
-    id: (place.name && typeof place.name === 'string' && place.name.startsWith('places/')) ? place.name.replace(/^places\//, '') : place.id,
-    name: place.displayName?.text || 'Unknown',
-    lat: place.location?.latitude || 0,
-    lng: place.location?.longitude || 0,
-    vicinity: place.formattedAddress,
-    rating: place.rating,
-    user_ratings_total: place.userRatingCount,
-    price_level: place.priceLevel,
-    types: place.types
-  })) || [];
+  return json.places?.map((p: any) => {
+    const id = (p.name && typeof p.name === 'string' && p.name.startsWith('places/')) ? p.name.replace(/^places\//, '') : p.id;
+    const photoName = p.photos?.[0]?.name; // e.g. "places/PLACE_ID/photos/PHOTO_ID"
+    const photoUrl = photoName ? `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=400&key=${API_KEY}` : undefined;
+    return {
+      id,
+      name: p.displayName?.text || 'Unknown',
+      lat: p.location?.latitude || 0,
+      lng: p.location?.longitude || 0,
+      address: p.formattedAddress,
+      vicinity: p.formattedAddress,
+      rating: p.rating,
+      user_ratings_total: p.userRatingCount,
+      price_level: p.priceLevel,
+      types: p.types,
+      photoUrl,
+    } as Place;
+  }) || [];
 }
 
 // ---------- メインコンポーネント ----------
@@ -233,19 +242,21 @@ export default function RecommendationRankingScreen({
     setMsg('🍽️ ご当地グルメを検索中...');
 
     try {
-      const specialties = [
-        `${prefecture} 名物`,
-        `${prefecture} ご当地グルメ`,
-        `${prefecture} 特産品 レストラン`,
-        `${prefecture} 郷土料理`
-      ];
+      // 都道府県ごとの代表的なご当地キーワードを使用して精度を上げる
+      const keywords = LOCAL_SPECIALTIES_KEYWORDS[prefecture] || [];
+      if (keywords.length === 0) {
+        setLoadingLocalSpecialties(false);
+        Alert.alert('ご当地グルメ', `${prefecture}のご当地グルメ情報がありません`);
+        return;
+      }
 
       const allResults: Place[] = [];
       
-      for (const specialty of specialties) {
+      // 代表的なキーワード上位から検索（ヒット数と速度のバランスで最大5件）
+      for (const specialty of keywords.slice(0, 5)) {
         try {
-          const results = await searchPlaces(specialty, loc.lat, loc.lng);
-          allResults.push(...results.slice(0, 3)); // 各グルメから3件まで
+          const results = await searchPlaces(`${specialty} ${prefecture}`, loc.lat, loc.lng);
+          allResults.push(...results.slice(0, 3)); // 各キーワードから3件まで
         } catch (error) {
           console.warn(`${specialty}の検索でエラー:`, error);
         }
@@ -325,8 +336,7 @@ export default function RecommendationRankingScreen({
           return;
         }
         
-        // 検索結果を親に渡す
-        onPlacesUpdate(targetPlaces);
+  // 検索結果はマップに送り込まない（戻った時に一覧が表示されないようにする）
       } catch (searchError) {
         console.error('周辺レストラン検索エラー:', searchError);
         Alert.alert('エラー', '周辺のレストラン検索に失敗しました');
@@ -359,18 +369,18 @@ export default function RecommendationRankingScreen({
   };
 
   return (
-    <SafeAreaView style={styles.container}>
-      <View style={styles.header}>
-        <TouchableOpacity 
-          style={styles.backButton}
-          onPress={() => navigation.goBack()}
-        >
-          <Text style={styles.backButtonText}>← 戻る</Text>
-        </TouchableOpacity>
-        <Text style={styles.headerTitle}>おすすめ＆ランキング</Text>
-      </View>
+  <View style={styles.container}>
+      <ScrollView style={styles.content} contentContainerStyle={styles.contentContainer}>
+        {/* 使い方（最上部） */}
+        <View style={styles.helpSection}>
+          <Text style={styles.helpTitle}>💡 使い方</Text>
+          <Text style={styles.helpText}>
+            • ご当地グルメ：その地域の名物料理が楽しめるお店を検索{'\n'}
+            • AIランキング：あなたの好みに合わせて周辺のお店をスコア化{'\n'}
+            • タップしたお店は地図に表示されます
+          </Text>
+        </View>
 
-      <ScrollView style={styles.content}>
         {/* 現在地表示 */}
         <View style={styles.locationInfo}>
           <Text style={styles.locationText}>
@@ -398,7 +408,6 @@ export default function RecommendationRankingScreen({
           </TouchableOpacity>
         </View>
 
-
         {/* AIランキングセクション */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>🤖 AIおすすめランキング</Text>
@@ -417,16 +426,6 @@ export default function RecommendationRankingScreen({
             )}
           </TouchableOpacity>
         </View>
-
-        {/* 使い方説明 */}
-        <View style={styles.helpSection}>
-          <Text style={styles.helpTitle}>💡 使い方</Text>
-          <Text style={styles.helpText}>
-            • ご当地グルメ：その地域の名物料理が楽しめるお店を検索{'\n'}
-            • AIランキング：あなたの好みに合わせて周辺のお店をスコア化{'\n'}
-            • タップしたお店は地図に表示されます
-          </Text>
-        </View>
       </ScrollView>
 
       {/* ご当地グルメモーダルは廃止（同画面内に表示） */}
@@ -444,7 +443,7 @@ export default function RecommendationRankingScreen({
         description={rankingDescription}
         reasoningTitle={rankingReasoningTitle}
       />
-    </SafeAreaView>
+  </View>
   );
 }
 
@@ -454,35 +453,19 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f5f5f5',
   },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    padding: 16,
-    backgroundColor: '#fff',
-    borderBottomWidth: 1,
-    borderBottomColor: '#e0e0e0',
-  },
-  backButton: {
-    marginRight: 16,
-  },
-  backButtonText: {
-    fontSize: 16,
-    color: '#007AFF',
-  },
-  headerTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    color: '#333',
-  },
   content: {
     flex: 1,
-    padding: 16,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+  },
+  contentContainer: {
+    paddingBottom: 24,
   },
   locationInfo: {
     backgroundColor: '#fff',
     padding: 16,
     borderRadius: 12,
-    marginBottom: 20,
+    marginBottom: 12,
     alignItems: 'center',
   },
   locationText: {
@@ -500,7 +483,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
     padding: 20,
     borderRadius: 12,
-    marginBottom: 16,
+    marginBottom: 12,
   },
   sectionTitle: {
     fontSize: 18,

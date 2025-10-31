@@ -246,6 +246,25 @@ async function searchPlaces(query: string, lat: number, lng: number): Promise<Pl
   });
 }
 
+// 足りない写真を個別に補完（Place Details）
+async function fetchPhotoUrlByPlaceId(placeId: string): Promise<string | undefined> {
+  if (!API_KEY) return undefined;
+  try {
+    const res = await fetch(`https://places.googleapis.com/v1/places/${placeId}`, {
+      headers: {
+        'X-Goog-Api-Key': API_KEY,
+        'X-Goog-FieldMask': 'photos',
+      },
+    });
+    if (!res.ok) return undefined;
+    const data = await res.json();
+    const photoName = data?.photos?.[0]?.name; // e.g. places/PLACE_ID/photos/PHOTO_ID
+    return photoName ? `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=640&key=${API_KEY}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // ---------- 経路 ----------
 async function computeRoute(
   origin: { lat: number; lng: number },
@@ -628,11 +647,18 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
     }
   };
 
-  // --- ご当地グルメ検索 ---
+  // --- ご当地グルメ検索（ランキング風一覧表示） ---
   const searchLocalSpecialties = async () => {
     if (!me || !currentPrefecture) {
       Alert.alert('位置情報が必要', '現在地を取得してからお試しください');
       return;
+    }
+
+    // 案内中なら一旦停止
+    if (navigating) {
+      stopNavigation();
+      setRoute(null);
+      setSelectedPlace(null);
     }
 
     const specialties = LOCAL_SPECIALTIES[currentPrefecture];
@@ -661,11 +687,39 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         const uniqueResults = allResults.filter((place, index, self) => 
           index === self.findIndex(p => p.id === place.id)
         );
-        
-    // モーダルで一覧を表示（マップ下のリストには出さない）
-    setLocalSpecialties(uniqueResults);
-        setShowLocalSpecialties(true);
-        setMsg(`🍽️ ${currentPrefecture}のご当地グルメ ${uniqueResults.length}件を表示中`);
+
+        // ランキング風に並べ替え（評価→件数）
+        uniqueResults.sort((a, b) => {
+          const ra = a.rating ?? 0;
+          const rb = b.rating ?? 0;
+          if (rb !== ra) return rb - ra;
+          const ca = a.userRatingCount ?? 0;
+          const cb = b.userRatingCount ?? 0;
+          return cb - ca;
+        });
+
+        // 写真がないスポットは詳細から補完
+        const enriched = await Promise.all(
+          uniqueResults.map(async (pl) => {
+            if (pl.photoUrl) return pl;
+            const url = await fetchPhotoUrlByPlaceId(pl.id);
+            return { ...pl, photoUrl: url } as Place;
+          })
+        );
+
+        // 通常検索と同じ横スライド一覧で表示（下部リスト）
+        const prev = places;
+        setLastPlaces(prev);
+        setLastPlacesLabel('ご当地グルメ');
+        setPlaces(enriched);
+        setSelectedPlace(null);
+        setShowLocalSpecialties(false);
+        if (UNDO_ENABLED) {
+          setShowUndo(true);
+          if (undoTimerRef.current) clearTimeout(undoTimerRef.current as any);
+          undoTimerRef.current = setTimeout(() => setShowUndo(false), 6000);
+        }
+        setMsg(`🍽️ ${currentPrefecture}のご当地グルメ ${enriched.length}件を表示中`);
       } else {
         setMsg(`${currentPrefecture}のご当地グルメが見つかりませんでした`);
       }
@@ -1304,7 +1358,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
           <FlatList
             data={localSpecialties}
             keyExtractor={(item) => item.id}
-            renderItem={({ item }) => (
+            renderItem={({ item, index }) => (
               <TouchableOpacity 
                 style={styles.recommendedSpotItem}
                 onPress={() => {
@@ -1320,6 +1374,12 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
                   }
                 }}
               >
+                {/* ランクバッジ */}
+                <View style={styles.rankRow}>
+                  <Text style={[styles.rankBadge, index === 0 && styles.rank1, index === 1 && styles.rank2, index === 2 && styles.rank3]}>
+                    {index + 1}
+                  </Text>
+                </View>
                 {item.photoUrl && (
                   <View style={{ marginBottom: 10 }}>
                     <Image source={{ uri: item.photoUrl }} style={styles.placeImage} />
@@ -1342,6 +1402,19 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
                   )}
                   {priceLevelToYen(item.priceLevel) && (
                     <Text style={styles.priceRange}>{priceLevelToYen(item.priceLevel)}</Text>
+                  )}
+                  {me && (
+                    <Text style={styles.distanceChip}>
+                      {(() => {
+                        try {
+                          const d = getDistance(
+                            { latitude: me.lat, longitude: me.lng },
+                            { latitude: item.lat, longitude: item.lng }
+                          );
+                          return `${(d / 1000).toFixed(1)}km`;
+                        } catch { return ''; }
+                      })()}
+                    </Text>
                   )}
                 </View>
               </TouchableOpacity>
@@ -1685,6 +1758,25 @@ const styles = StyleSheet.create({
     color: '#856404',
     fontWeight: '600',
   },
+  // ランキング用
+  rankRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  rankBadge: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    textAlign: 'center',
+    textAlignVertical: 'center',
+    fontWeight: '800',
+    color: '#fff',
+    backgroundColor: '#9e9e9e',
+  },
+  rank1: { backgroundColor: '#FFD700' }, // gold
+  rank2: { backgroundColor: '#C0C0C0' }, // silver
+  rank3: { backgroundColor: '#CD7F32' }, // bronze
   spotAddress: {
     fontSize: 14,
     color: '#6c757d',
@@ -1694,6 +1786,15 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 8,
     marginBottom: 8,
+  },
+  distanceChip: {
+    backgroundColor: '#eef2f7',
+    color: '#41546b',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    fontSize: 12,
+    fontWeight: '600',
   },
   cuisineType: {
     backgroundColor: '#e7f3ff',
