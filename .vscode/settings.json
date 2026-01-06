@@ -1,0 +1,12 @@
+{
+  "typescript.tsserver.experimental.enableProjectDiagnostics": false,
+  "typescript.tsserver.excludeDirectories": [
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/build/**",
+    "**/dist/**"
+  ],
+  "typescript.disableAutomaticTypeAcquisition": true,
+  "javascript.disableAutomaticTypeAcquisition": true,
+  "typescript.preferences.includePackageJsonAutoImports": "off"
+}

@@ -143,6 +143,7 @@ export default function RecommendationPanel({
 
           <View style={styles.reasonsContainer}>{renderReasons(reasons)}</View>
 
+
           {spot.distance && (
             <Text style={styles.distance}>
               📍 {(spot.distance / 1000).toFixed(1)} km

@@ -2,6 +2,7 @@
 const getPlaceholderImage = (): string => '';
 import React, { useState, useEffect } from 'react';
 import { View, Text, FlatList, TouchableOpacity, StyleSheet, Modal, Image } from 'react-native';
+import { Linking } from 'react-native';
 import { SpotScore } from '../utils/aiScoring';
 import { ensureGoogleApiKey } from '../utils/config';
 
@@ -150,6 +151,7 @@ interface AIRankingModalProps {
   title?: string;
   description?: string;
   reasoningTitle?: string;
+  mode?: 'ai' | 'local'; // 追加: 呼び出し側でランキング種別指定
 }
 
 const AIRankingModal: React.FC<AIRankingModalProps> = ({
@@ -160,8 +162,11 @@ const AIRankingModal: React.FC<AIRankingModalProps> = ({
   title,
   description,
   reasoningTitle,
+  mode,
 }) => {
   const [photoUrls, setPhotoUrls] = useState<{[key: string]: string}>({});
+  // ランキングモード判定（props優先。未指定なら環境変数で後方互換）
+  const isLocalRanking = mode === 'local' || (mode == null && process.env.EXPO_PUBLIC_LOCAL_RANKING_ONLY === '1');
   
   // 写真URLを取得してキャッシュ
   useEffect(() => {
@@ -284,49 +289,265 @@ const AIRankingModal: React.FC<AIRankingModalProps> = ({
         <View style={styles.spotInfo}>
           <Text style={styles.spotName} numberOfLines={2}>{item.place.name}</Text>
           <Text style={styles.spotAddress} numberOfLines={1}>{item.place.address}</Text>
+          {(() => {
+            // ご当地タグ（🏯除去後のキーワード）をバッジ表示（最大4件）
+            const localReasons = item.reasoning.filter(r => r.startsWith('🏯'))
+              .map(r => r.replace(/^🏯\s*/, ''));
+            const tags: string[] = [];
+            localReasons.forEach(text => {
+              text.split(/[、,]/).forEach(tok => {
+                const t = tok.trim();
+                if (t && !tags.includes(t) && tags.length < 4) tags.push(t);
+              });
+            });
+            // 補助タグ: 評価/営業中/価格帯
+            const rating = (item.place as any).rating as number | undefined;
+            const openNow = (item.place as any).openNow as boolean | undefined;
+            const priceRange = (item.place as any).priceRange as string | undefined;
+            const hpGenre = (item.place as any).hpGenre as string | undefined;
+            type TagKind = 'local' | 'rating' | 'open' | 'price';
+            type TagObj = { label: string; kind: TagKind | 'genre' };
+            const extraTags: TagObj[] = [];
+            const safetyFirst = item.reasoning.some(r => r.startsWith('🛡️'));
+            if (safetyFirst) extraTags.push({ label: '🛡️ アレルギー優先', kind: 'open' });
+            if (typeof rating === 'number') extraTags.push({ label: `⭐ ${rating.toFixed(1)}`, kind: 'rating' });
+            if (openNow === true) extraTags.push({ label: '⏰ 営業中', kind: 'open' });
+            if (priceRange) extraTags.push({ label: priceRange, kind: 'price' });
+            if (hpGenre) extraTags.push({ label: hpGenre, kind: 'genre' });
+            // 表示上限に余白があれば補助タグを追加（最大合計6件）
+            // ジャンルがある場合は優先的に含める
+            const capacity = 6 - tags.length;
+            const merged: TagObj[] = tags.slice(0, 6).map(t => ({ label: t, kind: 'local' }));
+            // まずジャンルを入れる
+            const genreTag = extraTags.find(e => e.kind === 'genre');
+            const restTags = extraTags.filter(e => e.kind !== 'genre');
+            if (genreTag && capacity > 0) {
+              merged.push(genreTag);
+            }
+            const remainingCapacity = 6 - merged.length;
+            restTags.slice(0, Math.max(0, remainingCapacity)).forEach(et => merged.push(et));
+            if (merged.length === 0) return null;
+            return (
+              <View style={styles.tagRow}>
+                {merged.map((tagObj, i) => (
+                  <View key={i} style={[
+                    styles.tagChip,
+                    tagObj.kind === 'rating' ? { backgroundColor: '#fffbe6', borderColor: '#ffe58f' } :
+                    tagObj.kind === 'open' ? { backgroundColor: '#e6fffb', borderColor: '#87e8de' } :
+                    tagObj.kind === 'price' ? { backgroundColor: '#f0fff4', borderColor: '#c6f6d5' } :
+                    tagObj.kind === 'genre' ? { backgroundColor: '#eef2ff', borderColor: '#c7d2fe' } :
+                    {}
+                  ]}>
+                    <Text style={[
+                      styles.tagText,
+                      tagObj.kind === 'rating' ? { color: '#ad6800' } :
+                      tagObj.kind === 'open' ? { color: '#006d75' } :
+                      tagObj.kind === 'price' ? { color: '#2f855a' } :
+                      tagObj.kind === 'genre' ? { color: '#3730a3' } :
+                      {}
+                    ]}>{tagObj.label}</Text>
+                  </View>
+                ))}
+              </View>
+            );
+          })()}
         </View>
-        <View style={styles.totalScoreContainer}>
-          <Text style={[styles.totalScore, { color: getScoreColor(item.totalScore) }]}>
-            {item.totalScore.toFixed(1)}
-          </Text>
-          <Text style={styles.totalScoreLabel}>総合</Text>
-        </View>
+        {isLocalRanking ? (
+          <View style={styles.dualScoreContainer}>
+            <View style={styles.totalScoreContainer}>
+              <Text style={[styles.totalScore, { color: '#FF5722' }]}>
+                {item.localScore.toFixed(1)}
+              </Text>
+              <Text style={styles.totalScoreLabel}>ご当地</Text>
+            </View>
+          </View>
+        ) : (
+          <View style={styles.dualScoreContainer}>
+            <View style={styles.totalScoreContainer}>
+              <Text style={[styles.totalScore, { color: getScoreColor(item.aiTotalScore || item.totalScore) }]}>
+                {(item.aiTotalScore || item.totalScore).toFixed(1)}
+              </Text>
+              <Text style={styles.totalScoreLabel}>AI</Text>
+            </View>
+          </View>
+        )}
       </View>
       
-      {/* 詳細スコア */}
+      {/* 詳細スコア：ローカルランキング時はご当地のみ */}
       <View style={styles.detailScores}>
-        {renderScoreBar('距離', item.distanceScore, '#2196F3')}
-        {renderScoreBar('評価', item.ratingScore, '#FFD700')}
-        {renderScoreBar('価格', item.priceScore, '#4CAF50')}
-        {renderScoreBar('嗜好', item.preferenceScore, '#E91E63')}
-        {renderScoreBar('ご当地', item.localScore, '#FF5722')}
+        {isLocalRanking ? (
+          <>
+            {renderScoreBar('ご当地', item.localScore, '#FF5722')}
+            {renderScoreBar('距離', item.distanceScore, '#2196F3')}
+            {renderScoreBar('評価', item.ratingScore, '#FFD700')}
+            {renderScoreBar('価格', item.priceScore, '#4CAF50')}
+          </>
+        ) : (
+          <>
+            {renderScoreBar('距離', item.distanceScore, '#2196F3')}
+            {renderScoreBar('評価', item.ratingScore, '#FFD700')}
+            {renderScoreBar('価格', item.priceScore, '#4CAF50')}
+            {renderScoreBar('嗜好', item.preferenceScore, '#E91E63')}
+            {/* ご当地スコアはAIランキングでは非表示 */}
+          </>
+        )}    
       </View>
+      {/* 予約/詳細リンク（HotPepper） */}
+      {(() => {
+        const hpUrl = (item.place as any).hpUrl as string | undefined;
+        const phone = (item.place as any).phoneNumber as string | undefined;
+        // Googleマップへのフォールバッ        // Googleマップは座標ではなく店名で検索する
+        const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(item.place.name)}`;
+        return (
+          <View style={styles.actionRow}>
+            {hpUrl ? (
+              <TouchableOpacity
+                style={styles.reserveButton}
+                onPress={() => Linking.openURL(hpUrl)}
+              >
+                <Text style={styles.reserveButtonText}>🔗 HotPepperで予約/詳細</Text>
+              </TouchableOpacity>
+            ) : null}
+            {!hpUrl && phone ? (
+              <TouchableOpacity
+                style={[styles.reserveButton, { backgroundColor: '#2e7d32' }]}
+                onPress={() => Linking.openURL(`tel:${phone.replace(/\s/g,'')}`)}
+              >
+                <Text style={styles.reserveButtonText}>📞 電話する</Text>
+              </TouchableOpacity>
+            ) : null}
+            {!hpUrl && !phone ? (
+              <TouchableOpacity
+                style={[styles.reserveButton, { backgroundColor: '#64748b' }]}
+                onPress={() => Linking.openURL(mapsUrl)}
+              >
+                <Text style={styles.reserveButtonText}>🗺️ Googleマップで開く</Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+        );
+      })()}
       
       {/* AI判断理由 */}
-      <View style={styles.reasoningContainer}>
-  <Text style={styles.reasoningTitle}>{reasoningTitle || '🤖 AIの判断理由:'}</Text>
-        {item.reasoning.map((reason, idx) => (
-          <Text key={idx} style={styles.reasoningText}>• {reason}</Text>
-        ))}
-      </View>
+      {(() => {
+        // ご当地理由とAI理由を分離（🏯 から始まるものをご当地タグとみなす）
+        const localReasons = item.reasoning.filter(r => r.startsWith('🏯'));
+        const aiReasons = item.reasoning.filter(r => !r.startsWith('🏯'));
+        return (
+          <View style={styles.reasoningOuter}>
+            {/* ご当地ランキング時は、店名下のバッジを優先し重複表示を避けるため、テキスト列挙は省略 */}
+            {isLocalRanking && (
+              <View style={styles.reasoningContainer}>
+                <Text style={styles.localReasoningTitle}>🍽️ ご当地タグ</Text>
+                {(() => {
+                  const expl: { label: string; color: string; bg: string; border: string }[] = [];
+                  const ds = item.distanceScore;
+                  const rs = item.ratingScore;
+                  const ps = item.priceScore;
+                  // 距離の説明
+                  if (ds >= 8) expl.push({ label: '📍 近距離', color: '#1e3a8a', bg: '#e0f2fe', border: '#bae6fd' });
+                  else if (ds >= 5) expl.push({ label: '📍 適距離', color: '#1e40af', bg: '#e0f2fe', border: '#bae6fd' });
+                  else expl.push({ label: '📍 やや遠め', color: '#1f2937', bg: '#f3f4f6', border: '#e5e7eb' });
+                  // 評価の説明
+                  if (rs >= 8) expl.push({ label: '⭐ 高評価', color: '#ad6800', bg: '#fffbe6', border: '#ffe58f' });
+                  else if (rs >= 6) expl.push({ label: '⭐ まずまず', color: '#795548', bg: '#f5efe6', border: '#e8ded1' });
+                  else expl.push({ label: '⭐ 平均的', color: '#6b7280', bg: '#f3f4f6', border: '#e5e7eb' });
+                  // 価格の説明
+                  if (ps >= 8) expl.push({ label: '💰 予算内', color: '#2f855a', bg: '#f0fff4', border: '#c6f6d5' });
+                  else if (ps >= 5) expl.push({ label: '💰 許容範囲', color: '#065f46', bg: '#ecfdf5', border: '#d1fae5' });
+                  else expl.push({ label: '💰 予算超過', color: '#b91c1c', bg: '#fee2e2', border: '#fecaca' });
+                  return (
+                    <View style={styles.tagRow}>
+                      {expl.slice(0, 3).map((e, idx) => (
+                        <View key={`local-expl-${idx}`} style={[styles.tagChip, { backgroundColor: e.bg, borderColor: e.border }]}> 
+                          <Text style={[styles.tagText, { color: e.color }]}>{e.label}</Text>
+                        </View>
+                      ))}
+                    </View>
+                  );
+                })()}
+                <Text style={[styles.reasoningTitle, { marginTop: 6 }]}>📝 ご当地の判断理由:</Text>
+                {(() => {
+                  // 既存のご当地理由がない場合のフォールバック表示
+                  const localReasonsRaw = item.reasoning.filter(r => r.startsWith('🏯'));
+                  const fallback = localReasonsRaw.length === 0
+                    ? [`ご当地度スコア: ${item.localScore.toFixed(1)}`]
+                    : localReasonsRaw.map(r => r.replace(/^🏯\s*/, ''));
+                  return fallback.map((reason, idx) => (
+                    <Text key={`local-reason-${idx}`} style={styles.localReasoningText}>• {reason}</Text>
+                  ));
+                })()}
+              </View>
+            )}
+            {/* AIランキング時はタグ + 残りの理由を列挙（タグで表示済みの上位3件は重複除外） */}
+            {!isLocalRanking && aiReasons.length > 0 && (
+              <View style={styles.reasoningContainer}>
+                <Text style={styles.reasoningTitle}>{reasoningTitle || '🤖 AIの判断理由:'}</Text>
+                {(() => {
+                  // AIモード用の説明タグ（距離/評価/価格/嗜好の要約）
+                  const ds = item.distanceScore;
+                  const rs = item.ratingScore;
+                  const ps = item.priceScore;
+                  const hs = item.preferenceScore;
+                  const chips: { label: string; color: string; bg: string; border: string }[] = [];
+                  const safetyFirst = item.reasoning.some(r => r.startsWith('🛡️'));
+                  if (safetyFirst) chips.push({ label: '🛡️ アレルギー優先', color: '#0f5132', bg: '#d1e7dd', border: '#badbcc' });
+                  // 距離
+                  if (ds >= 8) chips.push({ label: '📍 近距離', color: '#1e3a8a', bg: '#e0f2fe', border: '#bae6fd' });
+                  else if (ds >= 5) chips.push({ label: '📍 適距離', color: '#1e40af', bg: '#e0f2fe', border: '#bae6fd' });
+                  else chips.push({ label: '📍 やや遠め', color: '#1f2937', bg: '#f3f4f6', border: '#e5e7eb' });
+                  // 評価
+                  if (rs >= 8) chips.push({ label: '⭐ 高評価', color: '#ad6800', bg: '#fffbe6', border: '#ffe58f' });
+                  else if (rs >= 6) chips.push({ label: '⭐ まずまず', color: '#795548', bg: '#f5efe6', border: '#e8ded1' });
+                  else chips.push({ label: '⭐ 平均的', color: '#6b7280', bg: '#f3f4f6', border: '#e5e7eb' });
+                  // 価格
+                  if (ps >= 8) chips.push({ label: '💰 予算内', color: '#2f855a', bg: '#f0fff4', border: '#c6f6d5' });
+                  else if (ps >= 5) chips.push({ label: '💰 許容範囲', color: '#065f46', bg: '#ecfdf5', border: '#d1fae5' });
+                  else chips.push({ label: '💰 予算超過', color: '#b91c1c', bg: '#fee2e2', border: '#fecaca' });
+                  // 嗜好
+                  if (hs >= 7) chips.push({ label: '❤️ 好み一致', color: '#9d174d', bg: '#fde7f3', border: '#f8c9e4' });
+                  else if (hs >= 5) chips.push({ label: '❤️ 近い嗜好', color: '#be185d', bg: '#fde7f3', border: '#f8c9e4' });
+                  else chips.push({ label: '❤️ 好み外', color: '#6b7280', bg: '#f3f4f6', border: '#e5e7eb' });
+                  return (
+                    <View style={styles.tagRow}>
+                      {chips.slice(0, 4).map((c, idx) => (
+                        <View key={`ai-expl-${idx}`} style={[styles.tagChip, { backgroundColor: c.bg, borderColor: c.border }]}> 
+                          <Text style={[styles.tagText, { color: c.color }]}>{c.label}</Text>
+                        </View>
+                      ))}
+                    </View>
+                  );
+                })()}
+                {/* 重複回避のため、AI理由のタグ化は削除。説明チップ＋箇条書きのみ表示 */}
+                {aiReasons.slice(3).map((reason, idx) => (
+                  <Text key={`ai-${idx}`} style={styles.reasoningText}>• {reason}</Text>
+                ))}
+              </View>
+            )}
+          </View>
+        );
+      })()}
+
     </TouchableOpacity>
   );
 
   return (
-    <Modal visible={visible} animationType="slide" presentationStyle="pageSheet">
+      <Modal visible={visible} animationType="slide" presentationStyle="pageSheet">
       <View style={styles.container}>
         {/* ヘッダー */}
-        <View style={styles.header}>
-          <Text style={styles.title}>{title || '🤖 AI おすすめランキング'}</Text>
-          <TouchableOpacity style={styles.closeButton} onPress={onClose}>
-            <Text style={styles.closeButtonText}>✕</Text>
-          </TouchableOpacity>
-        </View>
+          <View style={styles.header}>
+            <Text style={styles.title}>{title || (isLocalRanking ? '🏯 ご当地度ランキング' : '🤖 AI おすすめランキング')}</Text>
+            <TouchableOpacity style={styles.closeButton} onPress={onClose}>
+              <Text style={styles.closeButtonText}>✕</Text>
+            </TouchableOpacity>
+          </View>
         
         {/* 説明 */}
         <View style={styles.description}>
           <Text style={styles.descriptionText}>
-            {description || '距離・評価・価格・あなたの嗜好・ご当地度を総合的に分析した結果です'}
+            {description || (isLocalRanking
+              ? 'この地域の名物・ご当地要素をスコア化したランキングです'
+              : '距離・評価・価格・あなたの嗜好・ご当地度を総合的に分析した結果です')}
           </Text>
         </View>
         
@@ -359,6 +580,8 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: '#e9ecef',
   },
+
+
   title: {
     fontSize: 20,
     fontWeight: '700',
@@ -455,8 +678,17 @@ const styles = StyleSheet.create({
   totalScoreContainer: {
     alignItems: 'center',
   },
+  dualScoreContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+  },
   totalScore: {
     fontSize: 24,
+    fontWeight: '700',
+  },
+  totalScoreSmall: {
+    fontSize: 18,
     fontWeight: '700',
   },
   totalScoreLabel: {
@@ -504,6 +736,10 @@ const styles = StyleSheet.create({
     padding: 12,
     borderRadius: 8,
   },
+  reasoningOuter: {
+    gap: 8,
+    marginBottom: 4,
+  },
   reasoningTitle: {
     fontSize: 14,
     fontWeight: '600',
@@ -515,6 +751,53 @@ const styles = StyleSheet.create({
     color: '#6c757d',
     lineHeight: 16,
     marginBottom: 2,
+  },
+  localReasoningTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#d9480f',
+    marginBottom: 6,
+  },
+  localReasoningText: {
+    fontSize: 12,
+    color: '#d9480f',
+    lineHeight: 16,
+    marginBottom: 2,
+  },
+  tagRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 6,
+  },
+  tagChip: {
+    backgroundColor: '#fff5e6',
+    borderColor: '#ffd8a8',
+    borderWidth: 1,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 12,
+  },
+  tagText: {
+    fontSize: 11,
+    color: '#d9480f',
+    fontWeight: '600',
+  },
+  actionRow: {
+    marginTop: 8,
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+  },
+  reserveButton: {
+    backgroundColor: '#1976d2',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+  },
+  reserveButtonText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '700',
   },
 });
 

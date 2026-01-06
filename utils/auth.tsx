@@ -14,7 +14,6 @@ export type User = {
   created_at: string;
   preferences?: {
     favoriteGenres: string[];
-    favoriteFoods: string[];
     priceRange: string;
     dietaryRestrictions: string[];
     preferredDistance: number;

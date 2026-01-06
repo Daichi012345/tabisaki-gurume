@@ -116,21 +116,77 @@ app.get('/api/auth/profile', authenticate, async (req, res) => {
 // トークン検証エンドポイント（認証状態確認）
 app.get('/api/auth/verify', authenticate, async (req, res) => {
   try {
-    // authenticateミドルウェアを通過した時点で、トークンは有効
-    const user = req.user;
+    // authenticateミドルウェアを通過した時点でトークンは有効
+    // JWTペイロードの一貫性に合わせて最小情報を返す
+    const payload = req.user;
     res.json({
       success: true,
       valid: true,
       user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        created_at: user.created_at
+        userId: payload.userId,
+        email: payload.email
       }
     });
   } catch (error) {
     console.error('❌ トークン検証エラー:', error);
     res.status(500).json({ error: 'トークンの検証に失敗しました' });
+  }
+});
+
+// ルート一覧の簡易デバッグ用（404調査）
+app.get('/debug/routes', (req, res) => {
+  try {
+    const routes = [];
+    app._router.stack.forEach((middleware) => {
+      if (middleware.route) {
+        const methods = Object.keys(middleware.route.methods)
+          .filter((m) => middleware.route.methods[m])
+          .map((m) => m.toUpperCase());
+        routes.push({ path: middleware.route.path, methods });
+      } else if (middleware.name === 'router' && middleware.handle.stack) {
+        middleware.handle.stack.forEach((handler) => {
+          if (handler.route) {
+            const methods = Object.keys(handler.route.methods)
+              .filter((m) => handler.route.methods[m])
+              .map((m) => m.toUpperCase());
+            routes.push({ path: handler.route.path, methods });
+          }
+        });
+      }
+    });
+    res.json({ count: routes.length, routes });
+  } catch (e) {
+    console.error('❌ ルート一覧取得エラー:', e);
+    res.status(500).json({ error: 'ルート一覧の取得に失敗しました' });
+  }
+});
+
+// =======================
+// 💴 価格取得（Hot Pepper API）
+// =======================
+// 使い方: GET /api/price?name=店名&lat=..&lng=..
+// 環境変数: HOTPEPPER_API_KEY
+app.get('/api/price', async (req, res) => {
+  try {
+    const apiKey = process.env.HOTPEPPER_API_KEY;
+    const { name, lat, lng } = req.query;
+    if (!apiKey) return res.status(400).json({ success: false, error: 'HOTPEPPER_API_KEY not set' });
+    if (!name || !lat || !lng) return res.status(400).json({ success: false, error: 'Missing name/lat/lng' });
+    const range = 3; // 300m程度
+    const url = `https://webservice.recruit.co.jp/hotpepper/gourmet/v1/?key=${apiKey}&format=json&name=${encodeURIComponent(name)}&lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}&range=${range}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      return res.status(502).json({ success: false, error: `HotPepper error ${r.status}: ${t}` });
+    }
+    const data = await r.json();
+    const shop = (data.results?.shop || [])[0];
+    if (!shop) return res.json({ success: true, priceRange: null });
+    const budgetName = shop.budget?.name || null; // 例: '2001～3000円'
+    return res.json({ success: true, priceRange: budgetName, source: 'hotpepper' });
+  } catch (e) {
+    console.error('❌ HotPepper API 価格取得エラー:', e);
+    return res.status(500).json({ success: false, error: 'Internal error fetching price' });
   }
 });
 
@@ -337,6 +393,121 @@ app.get('/api/recommend', async (req, res) => {
 });
 
 // =======================
+// ⭐ お気に入り/行きたい API
+// =======================
+
+// 取得
+app.get('/api/favorites', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const type = (req.query.type === 'wishlist') ? 'wishlist' : 'favorite';
+    const result = await query(
+      'SELECT place_id, place_name, place_address, latitude, longitude, rating, price_level, photo_url, list_type, created_at FROM favorites WHERE user_id=$1 AND list_type=$2 ORDER BY created_at DESC',
+      [userId, type]
+    );
+    res.json({ success: true, items: result.rows });
+  } catch (error) {
+    console.error('❌ お気に入り取得エラー:', error);
+    res.status(500).json({ error: 'お気に入りの取得に失敗しました' });
+  }
+});
+
+// 追加
+app.post('/api/favorites', [
+  authenticate,
+  body('place_id').isLength({ min: 1 }),
+  body('place_name').isLength({ min: 1 }),
+  body('list_type').optional().isIn(['favorite', 'wishlist'])
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ error: '入力エラー', details: errors.array() });
+  try {
+    const userId = req.user.userId;
+    const {
+      place_id,
+      place_name,
+      place_address,
+      latitude,
+      longitude,
+      rating,
+      price_level,
+      photo_url,
+      list_type = 'favorite'
+    } = req.body;
+    // デバッグログ（500調査用）
+    if (process.env.LOG_FAVORITES_DEBUG === 'true') {
+      console.log('🛠 favorites POST debug payload:', {
+        userId,
+        place_id,
+        place_name,
+        place_address,
+        latitude,
+        longitude,
+        rating,
+        price_level,
+        photo_url,
+        list_type
+      });
+    }
+    const sql = `INSERT INTO favorites (user_id, place_id, place_name, place_address, latitude, longitude, rating, price_level, photo_url, list_type)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                 ON CONFLICT (user_id, place_id, list_type) DO UPDATE SET
+                   place_name=EXCLUDED.place_name,
+                   place_address=EXCLUDED.place_address,
+                   latitude=EXCLUDED.latitude,
+                   longitude=EXCLUDED.longitude,
+                   rating=EXCLUDED.rating,
+                   price_level=EXCLUDED.price_level,
+                   photo_url=EXCLUDED.photo_url
+                 RETURNING *`;
+    const result = await query(sql, [userId, place_id, place_name, place_address, latitude, longitude, rating, price_level, photo_url, list_type]);
+    res.json({ success: true, item: result.rows[0] });
+  } catch (error) {
+    // 詳細エラー分類
+    console.error('❌ お気に入り追加エラー:', error.message, error.stack);
+    if (error.code === '23503') { // 外部キー制約
+      return res.status(400).json({ error: 'ユーザーが存在しません (FK)', code: error.code });
+    }
+    if (error.code === '22P02') { // 型変換エラー
+      return res.status(400).json({ error: '数値型の値が不正です', code: error.code });
+    }
+    if (error.code === '23505') { // ユニーク制約（通常はUPSERTで出ないはず）
+      return res.status(409).json({ error: 'ユニーク制約違反', code: error.code });
+    }
+    if (error.code === '22001') { // 文字列長オーバー
+      return res.status(400).json({ error: '文字列が長すぎます (photo_url など)', code: error.code });
+    }
+    res.status(500).json({ error: 'お気に入りの追加に失敗しました', message: error.message });
+  }
+});
+
+// デバッグ: 現在ユーザーのお気に入り行をそのまま返す（調査用）
+app.get('/debug/favorites/raw', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const r = await query('SELECT * FROM favorites WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50', [userId]);
+    res.json({ count: r.rowCount, rows: r.rows });
+  } catch (e) {
+    console.error('❌ favorites raw debug error:', e.message);
+    res.status(500).json({ error: 'raw取得失敗', message: e.message });
+  }
+});
+
+// 削除
+app.delete('/api/favorites/:placeId', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const placeId = req.params.placeId;
+    const type = (req.query.type === 'wishlist') ? 'wishlist' : 'favorite';
+    const result = await query('DELETE FROM favorites WHERE user_id=$1 AND place_id=$2 AND list_type=$3 RETURNING *', [userId, placeId, type]);
+    res.json({ success: true, deleted: result.rowCount });
+  } catch (error) {
+    console.error('❌ お気に入り削除エラー:', error);
+    res.status(500).json({ error: 'お気に入りの削除に失敗しました' });
+  }
+});
+
+// =======================
 // 📊 ヘルパー関数
 // =======================
 function getPriceRange(priceLevel) {
@@ -358,6 +529,8 @@ function getCuisineType(primaryType) {
   };
   return map[primaryType] || '飲食店';
 }
+
+// =======================
 
 // =======================
 // � ユーザー設定API
@@ -479,8 +652,6 @@ app.post('/api/user/action', [
   }
 });
 
-// =======================
-// � 起動
 // =======================
 // �🚀 起動
 // =======================

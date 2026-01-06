@@ -4,15 +4,17 @@ import MapView, { Marker, Polyline, PROVIDER_GOOGLE, Region } from 'react-native
 import * as Location from 'expo-location';
 import { getDistance } from 'geolib';
 import { Magnetometer } from 'expo-sensors';
-import Svg, { Path, Defs, LinearGradient, Stop } from 'react-native-svg';
 import RecommendationScreen from './RecommendationScreen';
 import MyPageScreen from './MyPageScreen';
 import AIRankingModal from './AIRankingModal';
 import { recommendationSystem, UserAction, SpotData } from '../utils/recommendation';
 import { useAuth } from '../utils/auth';
 import { apiCall } from '../utils/api';
-import { calculateAIScore, SpotScore } from '../utils/aiScoring';
+import { calculateAIScore, SpotScore, GENRE_SYNONYMS } from '../utils/aiScoring';
 import { ensureGoogleApiKey } from '../utils/config';
+import { addFavorite } from '../utils/favorites';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useFocusEffect } from '@react-navigation/native';
 
 const API_KEY: string = ensureGoogleApiKey();
 // Undo バー表示を無効化したい場合は false にする
@@ -32,37 +34,7 @@ const IMAGE_HEIGHT = Math.min(IMAGE_HEIGHT_BASE, IMAGE_MAX_BY_CONTAINER);
 // 案内中の時間表示を見やすくするため少し高めに設定
 const BOTTOM_PANEL_HEIGHT = 180;
 
-// ---------- SVGコンポーネント（ナビ矢印） ----------
-const NavigationArrow = ({
-  size = 40,
-  rotation = 0,
-}: {
-  size?: number;
-  rotation?: number;
-}) => (
-  <Svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    style={{
-      transform: [{ rotate: `${rotation}deg` }],
-    }}
-  >
-    <Defs>
-      <LinearGradient id="grad" x1="0" y1="0" x2="0" y2="1">
-        <Stop offset="0" stopColor="#1E90FF" />
-        <Stop offset="1" stopColor="#0056CC" />
-      </LinearGradient>
-    </Defs>
-    <Path
-      d="M12 2 L19 21 L12 17 L5 21 Z"
-      fill="url(#grad)"
-      stroke="#FFFFFF"
-      strokeWidth={2}
-      strokeLinejoin="round"
-    />
-  </Svg>
-);
+// ※ナビ矢印（SVG）は非表示化のため削除
 
 // ---------- 型定義 ----------
 type Place = {
@@ -75,9 +47,11 @@ type Place = {
   userRatingCount?: number;
   photoUrl?: string;
   priceRange?: string;
-  priceLevel?: string;
+  priceLevel?: string | number;
   cuisineType?: string;
   reasons?: string[];
+  types?: string[]; // Google Places types（ジャンル補完用）
+  openNow?: boolean; // 現在営業中か
 };
 
 type RouteInfo = {
@@ -110,7 +84,7 @@ async function getLocationFast(): Promise<Location.LocationObject | null> {
     ]);
     return location;
   } catch (error) {
-    
+
     try {
       return await Location.getLastKnownPositionAsync();
     } catch {
@@ -127,9 +101,9 @@ async function getPrefectureFromCoords(lat: number, lng: number): Promise<string
     const res = await fetch(
       `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&key=${API_KEY}&language=ja&result_type=administrative_area_level_1`
     );
-    
+
     const data = await res.json();
-    
+
     if (data.results && data.results.length > 0) {
       for (const result of data.results) {
         for (const component of result.address_components) {
@@ -139,7 +113,7 @@ async function getPrefectureFromCoords(lat: number, lng: number): Promise<string
         }
       }
     }
-    
+
     throw new Error('都道府県が見つかりませんでした');
   } catch (error) {
     console.error('都道府県取得エラー:', error);
@@ -175,7 +149,7 @@ const LOCAL_SPECIALTIES: { [key: string]: string[] } = {
   '三重県': ['松阪牛', '伊勢うどん', '赤福', 'てこね寿司'],
   '滋賀県': ['近江牛', 'ふな寿司', '鮒ずし', '湖魚料理'],
   '京都府': ['京料理', '湯豆腐', 'おばんざい', '抹茶スイーツ', '京野菜'],
-  '大阪府': ['たこ焼き', 'お好み焼き', '串カツ', 'イカ焼き', 'きつねうどん'],
+  '大阪府': ['たこ焼き', 'お好み焼き', '串カツ', 'イカ焼き', '551蓬莱'],
   '兵庫県': ['神戸牛', '明石焼き', 'いかなごのくぎ煮', '淡路島玉ねぎ'],
   '奈良県': ['柿の葉寿司', '奈良漬', '三輪そうめん', '吉野葛'],
   '和歌山県': ['梅干し', 'みかん', '和歌山ラーメン', 'めはり寿司'],
@@ -216,6 +190,8 @@ async function searchPlaces(query: string, lat: number, lng: number): Promise<Pl
         'places.rating',
         'places.userRatingCount',
         'places.priceLevel',
+        'places.types',
+        'places.currentOpeningHours.openNow',
         'places.photos'
       ].join(','),
     },
@@ -241,6 +217,8 @@ async function searchPlaces(query: string, lat: number, lng: number): Promise<Pl
       rating: p.rating,
       userRatingCount: p.userRatingCount,
       priceLevel: p.priceLevel,
+      types: p.types,
+      openNow: p.currentOpeningHours?.openNow,
       photoUrl,
     } as Place;
   });
@@ -290,7 +268,13 @@ async function computeRoute(
   });
 
   const json = await res.json();
-  const r = json.routes?.[0];
+  if (!json.routes || json.routes.length === 0) {
+    throw new Error('経路が見つかりませんでした（Routes API）');
+  }
+  const r = json.routes[0];
+  if (!r?.polyline?.encodedPolyline) {
+    throw new Error('経路ポリラインを取得できませんでした');
+  }
   const coords = decodePolyline(r.polyline.encodedPolyline);
   // 累積距離を計算
   const cumulativeDistances: number[] = [];
@@ -383,6 +367,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
   const [deviceHeading, setDeviceHeading] = useState(0);
   const [showRecommendationScreen, setShowRecommendationScreen] = useState(false);
   const [showMyPage, setShowMyPage] = useState(false);
+  const prevShowMyPageRef = useRef<boolean>(false);
   const [userPreferences, setUserPreferences] = useState<any>(null);
   const [recommendedSpots, setRecommendedSpots] = useState<Place[]>([]);
   const [loadingRecommendations, setLoadingRecommendations] = useState(false);
@@ -398,6 +383,33 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
   const mapRef = useRef<MapView | null>(null);
   const navInterval = useRef<NodeJS.Timeout | null>(null);
   const locationWatcher = useRef<Location.LocationSubscription | null>(null);
+  const autoStartNavRef = useRef<boolean>(false);
+  const lastMeRef = useRef<{ lat: number; lng: number } | null>(null);
+  const prevMeRef = useRef<{ lat: number; lng: number } | null>(null);
+  const [courseHeading, setCourseHeading] = useState<number | null>(null);
+
+  // 選択中スポットの写真が未取得なら取得して反映
+  useEffect(() => {
+    const run = async () => {
+      if (selectedPlace && !selectedPlace.photoUrl) {
+        try {
+          const url = await fetchPhotoUrlByPlaceId(selectedPlace.id);
+          if (url) {
+            setSelectedPlace((sp) => (sp && sp.id === selectedPlace.id) ? { ...sp, photoUrl: url } : sp);
+            setPlaces((arr) => arr.map((p) => p.id === selectedPlace.id ? { ...p, photoUrl: url } : p));
+          }
+        } catch {}
+      }
+    };
+    run();
+  }, [selectedPlace]);
+
+  // meが更新されたら最後の現在地を保存（描画フォールバック用）
+  useEffect(() => {
+    if (me && typeof me.lat === 'number' && typeof me.lng === 'number') {
+      lastMeRef.current = { lat: me.lat, lng: me.lng };
+    }
+  }, [me]);
 
   // 表示用の補助関数
   const formatRating = (rating?: number, count?: number) => {
@@ -405,21 +417,27 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
     const r = Number(rating).toFixed(1);
     return count ? `⭐ ${r} (${count.toLocaleString()})` : `⭐ ${r}`;
   };
-  const priceLevelToYen = (level?: string) => {
+  const priceLevelToYen = (level?: string | number) => {
     // Maps Places API v1 の PriceLevel: PRICE_LEVEL_INEXPENSIVE/EXPENSIVE 等
-    switch (level) {
-      case 'PRICE_LEVEL_FREE':
-        return '無料';
-      case 'PRICE_LEVEL_INEXPENSIVE':
-        return '¥';
-      case 'PRICE_LEVEL_MODERATE':
-        return '¥¥';
-      case 'PRICE_LEVEL_EXPENSIVE':
-        return '¥¥¥';
-      case 'PRICE_LEVEL_VERY_EXPENSIVE':
-        return '¥¥¥¥';
-      default:
-        return undefined;
+    if (typeof level === 'number') {
+      // 0〜4 を ¥〜¥¥¥¥ にマッピング（0は安価扱い）
+      const map = ['¥', '¥', '¥¥', '¥¥¥', '¥¥¥¥'];
+      return map[Math.max(0, Math.min(4, Math.floor(level)))] ?? undefined;
+    } else {
+      switch (level) {
+        case 'PRICE_LEVEL_FREE':
+          return '無料';
+        case 'PRICE_LEVEL_INEXPENSIVE':
+          return '¥';
+        case 'PRICE_LEVEL_MODERATE':
+          return '¥¥';
+        case 'PRICE_LEVEL_EXPENSIVE':
+          return '¥¥¥';
+        case 'PRICE_LEVEL_VERY_EXPENSIVE':
+          return '¥¥¥¥';
+        default:
+          return undefined;
+      }
     }
   };
 
@@ -477,16 +495,49 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
     }
   };
 
+  // 価格記号→内部価格帯 (AIスコア用) 変換
+  const mapPriceToRange = (priceSymbol: string): string => {
+    const priceMap: Record<string, string> = {
+      '¥': '～1000円',
+      '¥¥': '～2000円',
+      '¥¥¥': '～3000円',
+      '¥¥¥¥': '5000円～'
+    };
+    return priceMap[priceSymbol] || '～2000円';
+  };
+
   // --- 方位センサー ---
   useEffect(() => {
-    const subscription = Magnetometer.addListener((data) => {
-      const { x, y } = data;
-      let angle = Math.atan2(y, x) * (180 / Math.PI);
-      angle = (angle + 360) % 360;
-      setDeviceHeading(angle);
-    });
-    Magnetometer.setUpdateInterval(500);
-    return () => subscription.remove();
+    // 端末のHeadingが取得できる場合は優先（より安定）
+    let headingSub: Location.LocationSubscription | null = null;
+    (async () => {
+      try {
+        headingSub = await Location.watchHeadingAsync((h) => {
+          // trueHeading が利用可能ならそれを使用、なければ magHeading を採用
+          const deg = typeof h.trueHeading === 'number' && !isNaN(h.trueHeading)
+            ? h.trueHeading
+            : (typeof h.magHeading === 'number' ? h.magHeading : deviceHeading);
+          const normalized = ((deg % 360) + 360) % 360;
+          // 進行方向が明確（移動ベクトルが有意）ならそれを優先
+          setDeviceHeading(courseHeading != null ? courseHeading : normalized);
+        });
+      } catch {
+        // フォールバック：Magnetometer を使用
+        const subscription = Magnetometer.addListener((data) => {
+          const { x, y } = data;
+          let angle = Math.atan2(y, x) * (180 / Math.PI);
+          angle = (angle + 360) % 360;
+          setDeviceHeading(courseHeading != null ? courseHeading : angle);
+        });
+        Magnetometer.setUpdateInterval(300);
+        headingSub = {
+          remove: () => subscription.remove(),
+        } as unknown as Location.LocationSubscription;
+      }
+    })();
+    return () => {
+      try { headingSub?.remove?.(); } catch {}
+    };
   }, []);
 
   // --- 初回の現在地取得 ---
@@ -500,13 +551,13 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         }
 
         setMsg('📡 位置情報を取得中...');
-        
+
         const quickLocation = await getLocationFast();
-        
+
 
         if (quickLocation?.coords) {
           const { latitude, longitude } = quickLocation.coords;
-          
+
           setMe({ lat: latitude, lng: longitude });
           setRegion({
             latitude,
@@ -515,17 +566,17 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
             longitudeDelta: 0.01,
           });
           setMsg('🔵 現在地を取得しました');
-          
+
           // 都道府県を取得
           try {
             const prefecture = await getPrefectureFromCoords(latitude, longitude);
             setCurrentPrefecture(prefecture);
-            
+
           } catch (error) {
             console.error('都道府県取得失敗:', error);
           }
         } else {
-          
+
           setMsg('⚠️ 位置情報の取得に失敗しました');
         }
       } catch (err) {
@@ -542,18 +593,18 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
       if (token) {
         headers['Authorization'] = `Bearer ${token}`;
       }
-      
-      const response = await apiCall('/api/user/preferences', { 
+
+      const response = await apiCall('/api/user/preferences', {
         method: 'GET',
-        headers 
+        headers
       });
       const data = await response.json();
       if (data.success) {
         setUserPreferences(data.preferences);
-        
+
       }
     } catch (error) {
-      
+
     }
   };
 
@@ -565,7 +616,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
   // --- 検索 ---
   const handleSearch = async () => {
     if (!query.trim()) return;
-    
+
     // 現在地が無い場合は再取得
     if (!me) {
       setMsg('📡 現在地を取得中...');
@@ -574,7 +625,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         if (location?.coords) {
           const { latitude, longitude } = location.coords;
           setMe({ lat: latitude, lng: longitude });
-          
+
         } else {
           setMsg('⚠️ 現在地の取得に失敗しました');
           return;
@@ -584,7 +635,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         return;
       }
     }
-    
+
     try {
       const currentLocation = me || await (async () => {
         const location = await getLocationFast();
@@ -595,24 +646,24 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         }
         return null;
       })();
-      
+
       if (!currentLocation) {
         setMsg('⚠️ 現在地の取得に失敗しました');
         return;
       }
-      
-  const results = await searchPlaces(query, currentLocation.lat, currentLocation.lng);
-  // places を更新（undo 対応）
-  const prev = places;
-  setLastPlaces(prev);
-  setLastPlacesLabel('検索結果');
-  setPlaces(results);
-  setSelectedPlace(null);
-  if (UNDO_ENABLED) {
-    setShowUndo(true);
-    if (undoTimerRef.current) clearTimeout(undoTimerRef.current as any);
-    undoTimerRef.current = setTimeout(() => setShowUndo(false), 6000);
-  }
+
+      const results = await searchPlaces(query, currentLocation.lat, currentLocation.lng);
+      // places を更新（undo 対応）
+      const prev = places;
+      setLastPlaces(prev);
+      setLastPlacesLabel('検索結果');
+      setPlaces(results);
+      setSelectedPlace(null);
+      if (UNDO_ENABLED) {
+        setShowUndo(true);
+        if (undoTimerRef.current) clearTimeout(undoTimerRef.current as any);
+        undoTimerRef.current = setTimeout(() => setShowUndo(false), 6000);
+      }
       setMsg('');
     } catch (e: any) {
       setMsg(e.message);
@@ -622,7 +673,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
   // --- 検索テキスト変更の監視 ---
   const handleQueryChange = (text: string) => {
     setQuery(text);
-    
+
     // 検索テキストが空になったら経路とスポットをクリア
     if (!text.trim()) {
       // クリアは undo 可能にする
@@ -637,12 +688,12 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         undoTimerRef.current = setTimeout(() => setShowUndo(false), 6000);
       }
       setRoute(null);
-      
+
       // 案内中だった場合は案内も停止
       if (navigating) {
         stopNavigation();
       }
-      
+
       setMsg('');
     }
   };
@@ -668,23 +719,23 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
     }
 
     setMsg(`🍽️ ${currentPrefecture}のご当地グルメを検索中...`);
-    
+
     try {
       const allResults: Place[] = [];
-      
+
       // 各ご当地グルメを検索
       for (const specialty of specialties.slice(0, 3)) { // 最初の3つだけ検索
         try {
           const results = await searchPlaces(`${specialty} ${currentPrefecture}`, me.lat, me.lng);
           allResults.push(...results.slice(0, 2)); // 各グルメから2件まで
         } catch (error) {
-          
+
         }
       }
-      
+
       if (allResults.length > 0) {
         // 重複を除去
-        const uniqueResults = allResults.filter((place, index, self) => 
+        const uniqueResults = allResults.filter((place, index, self) =>
           index === self.findIndex(p => p.id === place.id)
         );
 
@@ -732,7 +783,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
   // --- AIランキング計算 ---
   const calculateAIRanking = async () => {
     let currentLocation = me;
-    
+
     // 位置情報がない場合は改めて取得を試行
     if (!currentLocation) {
       setMsg('📡 位置情報を取得中...');
@@ -761,9 +812,9 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
 
     try {
       setLoadingAIRanking(true);
-      
+
       let targetPlaces = places;
-      
+
       // placesが空の場合は自動的に周辺のレストランを検索
       if (places.length === 0) {
         setMsg('🔍 周辺のレストランを検索中...');
@@ -776,12 +827,12 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
           } else {
             targetPlaces = nearbyRestaurants;
           }
-          
+
           if (targetPlaces.length === 0) {
             Alert.alert('スポット不足', '周辺にレストランが見つかりませんでした。別の場所で試してください。');
             return;
           }
-          
+
           // 検索結果をmapに表示（undo 対応）
           setLastPlaces(places);
           setLastPlacesLabel('周辺検索');
@@ -801,10 +852,48 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
       setMsg('🤖 AIが総合スコアを計算中...');
 
       // AIスコアリング実行
-      const scores = await calculateAIScore(targetPlaces, currentLocation, currentPrefecture);
-      setAiScores(scores);
+      // ジャンル補完: favoriteGenres 先頭ジャンルの同義語で最低件数確保
+      if (userPreferences?.favoriteGenres?.length) {
+        const active = userPreferences.favoriteGenres[0];
+        const synonyms = GENRE_SYNONYMS[active] || [active];
+        const minNeeded = Number(process.env.EXPO_PUBLIC_GENRE_MIN ?? '3');
+        const lowerSyns = synonyms.map(s => s.toLowerCase());
+        const currentGenreCount = targetPlaces.filter(p => {
+          const text = `${p.name || ''} ${(p.types || []).join(' ')}`.toLowerCase();
+          return lowerSyns.some(s => text.includes(s));
+        }).length;
+        if (currentGenreCount < minNeeded) {
+          const extra: any[] = [];
+          for (const syn of synonyms.slice(0, 5)) {
+            try {
+              const r = await searchPlaces(syn, currentLocation.lat, currentLocation.lng);
+              extra.push(...r);
+            } catch { }
+            if (extra.length + currentGenreCount >= minNeeded) break;
+          }
+          if (extra.length) {
+            targetPlaces = [...targetPlaces, ...extra].filter((pl, idx, arr) => idx === arr.findIndex(x => x.id === pl.id));
+          }
+        }
+      }
+
+      const scores = await calculateAIScore(
+        targetPlaces,
+        currentLocation,
+        currentPrefecture,
+        process.env.EXPO_PUBLIC_DEBUG_SCORING === '1',
+        { localStrict: false },
+        {
+          favoriteGenres: userPreferences?.favoriteGenres || [],
+          budgetRange: mapPriceToRange(userPreferences?.priceRange || '¥¥'),
+          allergies: userPreferences?.dietaryRestrictions || [],
+          preferredDistance: userPreferences?.preferredDistance || 0
+        } as any
+      );
+      const top10 = scores.slice(0, 10);
+      setAiScores(top10);
       setShowAIRanking(true);
-      setMsg(`🤖 AIランキング計算完了！ ${scores.length}件を分析`);
+      setMsg(`🤖 AIランキング計算完了！ Top10を表示中 (${top10.length}件)`);
     } catch (error) {
       console.error('AIランキング計算エラー:', error);
       Alert.alert('エラー', 'AIランキングの計算に失敗しました');
@@ -826,6 +915,8 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         longitudeDelta: 0.01,
       });
     }
+    // ランキングモーダルは閉じる（UI衝突回避）
+    setShowAIRanking(false);
     setMsg(`📍 ${score.place.name} への経路を表示中`);
   };
 
@@ -838,8 +929,8 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
 
     setLoadingRecommendations(true);
     try {
-      
-      
+
+
       // ユーザー設定に基づくパラメータを構築
       const params = new URLSearchParams({
         lat: me.lat.toString(),
@@ -851,11 +942,11 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
       if (userPreferences?.favoriteGenres?.length > 0) {
         params.append('genres', userPreferences.favoriteGenres.join(','));
       }
-      
+
       if (userPreferences?.priceRange) {
         params.append('priceRange', userPreferences.priceRange);
       }
-      
+
       if (userPreferences?.dietaryRestrictions?.length > 0) {
         params.append('dietary', userPreferences.dietaryRestrictions.join(','));
       }
@@ -869,9 +960,9 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         method: 'GET',
         headers
       });
-      
+
       const data = await response.json();
-      
+
       if (data.success && data.spots) {
         const spots: Place[] = data.spots.map((spot: any) => ({
           id: spot.id,
@@ -884,17 +975,17 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
           cuisineType: spot.cuisineType,
           reasons: spot.reasons
         }));
-        
-  setRecommendedSpots(spots);
-  // undo 対応
-  setLastPlaces(places);
-  setLastPlacesLabel('おすすめ取得');
-  setPlaces(spots); // マップ上に表示
+
+        setRecommendedSpots(spots);
+        // undo 対応
+        setLastPlaces(places);
+        setLastPlacesLabel('おすすめ取得');
+        setPlaces(spots); // マップ上に表示
         setShowRecommendedList(true); // リスト表示
-        
+
         setMsg(`🎯 あなたの好みに基づく${spots.length}件のおすすめスポットを表示中`);
       } else {
-        
+
         setMsg('周辺におすすめスポットが見つかりませんでした');
       }
     } catch (error) {
@@ -906,15 +997,43 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
   };
 
   // --- 経路描画 ---
-  const drawRoute = async (p: Place) => {
-    if (!me) return;
+  const drawRoute = async (p: Place): Promise<RouteInfo | null> => {
     try {
+      // 現在地が未設定・古い可能性があるため、その場で取得を試行
+      let origin = me;
+      if (!origin) {
+        const quick = await getLocationFast();
+        if (quick?.coords) {
+          origin = { lat: quick.coords.latitude, lng: quick.coords.longitude };
+          setMe(origin);
+          setRegion({
+            latitude: origin.lat,
+            longitude: origin.lng,
+            latitudeDelta: 0.01,
+            longitudeDelta: 0.01,
+          });
+        } else {
+          throw new Error('現在地が取得できませんでした');
+        }
+      }
       setSelectedPlace(p);
-      const r = await computeRoute(me, { lat: p.lat, lng: p.lng }, travelMode);
+      setPlaces([p]);
+      const r = await computeRoute(origin, { lat: p.lat, lng: p.lng }, travelMode);
       setRoute(r);
+      // ルート全体が収まるようにフィットして、現在地アイコンも画面内に入れる
+      if (mapRef.current && r?.coords?.length) {
+        try {
+          mapRef.current.fitToCoordinates(r.coords, {
+            edgePadding: { top: 80, bottom: 220, left: 40, right: 40 },
+            animated: true,
+          });
+        } catch {}
+      }
       setMsg(null);
+      return r;
     } catch (e: any) {
       setMsg(`経路取得失敗: ${e.message}`);
+      return null;
     }
   };
 
@@ -938,6 +1057,13 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
   // --- 案内開始 ---
   const startNavigation = async () => {
     if (!route || !me) return;
+    // 初期の現在地を即時反映して、描画の空白時間をなくす
+    try {
+      const initPos = await Location.getCurrentPositionAsync({});
+      if (initPos?.coords) {
+        setMe({ lat: initPos.coords.latitude, lng: initPos.coords.longitude });
+      }
+    } catch {}
     setNavigating(true);
     setMsg('🚶 案内を開始しました');
     // 初期進捗リセット
@@ -954,9 +1080,9 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
       (pos) => {
         if (!pos?.coords) return;
         const { latitude, longitude } = pos.coords;
-        
+
         // 現在地を確実に更新
-        
+
         setMe({ lat: latitude, lng: longitude });
 
         // 進捗を更新
@@ -998,7 +1124,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
       if (distance < 20) {
         stopNavigation();
         setMsg('🎉 目的地に到着しました');
-        
+
         // 5秒後にメッセージを消す
         setTimeout(() => {
           setMsg('');
@@ -1013,7 +1139,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
   const stopNavigation = async () => {
     // 現在の位置を保存
     const currentMe = me;
-    
+
     if (navInterval.current) clearInterval(navInterval.current);
     if (locationWatcher.current) {
       locationWatcher.current.remove();
@@ -1021,23 +1147,25 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
     }
     setNavigating(false);
     setRoute(null); // ルートをクリア
-  setRouteProgressIndex(null);
-  setRemainingDistanceMeters(null);
-  setRemainingDurationSec(null);
-  // スポットをクリア（undo 対応）
-  setLastPlaces(places);
-  setLastPlacesLabel('案内終了でクリア');
-  setPlaces([]); // スポットもクリア
-  setSelectedPlace(null);
-    
+    setRouteProgressIndex(null);
+    setRemainingDistanceMeters(null);
+    setRemainingDurationSec(null);
+    // 検索欄もクリア
+    setQuery('');
+    // スポットをクリア（undo 対応）
+    setLastPlaces(places);
+    setLastPlacesLabel('案内終了でクリア');
+    setPlaces([]); // スポットもクリア
+    setSelectedPlace(null);
+
     // 現在地を確実に保持
     if (currentMe) {
       setMe(currentMe);
-      
+
     }
-    
+
     setMsg('🚫 案内を終了しました');
-    
+
     // 追加で現在地を再取得（バックアップ）
     setTimeout(async () => {
       try {
@@ -1045,7 +1173,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         if (location?.coords) {
           const { latitude, longitude } = location.coords;
           setMe({ lat: latitude, lng: longitude });
-          
+
         }
       } catch (error) {
         console.error('案内終了後の現在地取得エラー:', error);
@@ -1055,34 +1183,174 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         }
       }
     }, 100);
-    
+
     // 3秒後にメッセージを消す
     setTimeout(() => {
       setMsg('');
     }, 3000);
   };
 
+
   // --- 推薦ボタンを押した時の処理 ---
   const handleRecommendationPress = () => {
-    
-    
-    
+
+
+
     if (!me) {
       Alert.alert('位置情報が必要', '現在地を取得してから推薦機能をお使いください');
       return;
     }
 
-    
+
     setShowRecommendationScreen(true);
   };
 
+  // --- MyPageモーダルを閉じた直後にも openPlace を処理 ---
+  const handleOpenPlaceFromStorage = async () => {
+    try {
+      const raw = await AsyncStorage.getItem('openPlace');
+      if (!raw) return false;
+      await AsyncStorage.removeItem('openPlace');
+      const data = JSON.parse(raw);
+      const openPlace: Place = {
+        id: data.place_id || data.id || `${data.lat},${data.lng}`,
+        name: data.place_name || data.name || '目的地',
+        lat: Number(data.lat ?? data.latitude),
+        lng: Number(data.lng ?? data.longitude),
+        address: data.address,
+        rating: data.rating,
+        photoUrl: data.photo_url || data.photoUrl,
+        priceLevel: data.priceLevel,
+      };
+      setPlaces([openPlace]);
+      setSelectedPlace(openPlace);
+      if (!me) {
+        const loc = await getLocationFast();
+        if (loc?.coords) {
+          const { latitude, longitude } = loc.coords;
+          setMe({ lat: latitude, lng: longitude });
+          setRegion({ latitude, longitude, latitudeDelta: 0.01, longitudeDelta: 0.01 });
+        }
+      }
+      const r = await drawRoute(openPlace);
+      setMsg(`📍 ${openPlace.name} への経路を表示中`);
+      if (mapRef.current) {
+        mapRef.current.animateToRegion({
+          latitude: openPlace.lat,
+          longitude: openPlace.lng,
+          latitudeDelta: 0.01,
+          longitudeDelta: 0.01,
+        });
+        if (r?.coords?.length) {
+          try {
+            mapRef.current.fitToCoordinates(r.coords, {
+              edgePadding: { top: 80, bottom: 220, left: 40, right: 40 },
+              animated: true,
+            });
+          } catch {}
+        }
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  useEffect(() => {
+    // true -> false（モーダルを閉じた瞬間）だけ処理する
+    if (prevShowMyPageRef.current && !showMyPage) {
+      handleOpenPlaceFromStorage();
+    }
+    prevShowMyPageRef.current = showMyPage;
+  }, [showMyPage]);
+
+  // --- MyPageからの「地図で開く」連携 ---
+  useFocusEffect(
+    React.useCallback(() => {
+      let isActive = true;
+
+      (async () => {
+        try {
+          const raw = await AsyncStorage.getItem('openPlace');
+          if (!raw || !isActive) return;
+
+          await AsyncStorage.removeItem('openPlace');
+          const data = JSON.parse(raw);
+          const openPlace: Place = {
+            id: data.place_id || data.id || `${data.lat},${data.lng}`,
+            name: data.place_name || data.name || '目的地',
+            lat: Number(data.lat ?? data.latitude),
+            lng: Number(data.lng ?? data.longitude),
+            address: data.address,
+            rating: data.rating,
+            photoUrl: data.photo_url || data.photoUrl,
+            priceLevel: data.priceLevel,
+          };
+
+          // マーカーを即座に表示し、選択状態にしておく
+          setPlaces([openPlace]);
+          setSelectedPlace(openPlace);
+
+          // 現在地が未取得ならここで quietly 取得
+          if (!me) {
+            const loc = await getLocationFast();
+            if (loc?.coords) {
+              const { latitude, longitude } = loc.coords;
+              if (!isActive) return;
+              setMe({ lat: latitude, lng: longitude });
+              setRegion({
+                latitude,
+                longitude,
+                latitudeDelta: 0.01,
+                longitudeDelta: 0.01,
+              });
+            }
+          }
+
+          // 経路だけ表示（ナビ自動開始はしない）
+          const routeInfo = await drawRoute(openPlace);
+          if (!isActive) return;
+
+          setMsg(`📍 ${openPlace.name} への経路を表示中`);
+
+          if (mapRef.current && isFinite(openPlace.lat) && isFinite(openPlace.lng)) {
+            mapRef.current.animateToRegion({
+              latitude: openPlace.lat,
+              longitude: openPlace.lng,
+              latitudeDelta: 0.01,
+              longitudeDelta: 0.01,
+            });
+            // ルートのポリライン全体が収まるようにフィット
+            if (routeInfo?.coords?.length) {
+              try {
+                mapRef.current.fitToCoordinates(routeInfo.coords, {
+                  edgePadding: { top: 80, bottom: 220, left: 40, right: 40 },
+                  animated: true,
+                });
+              } catch {}
+            }
+          }
+        } catch (e) {
+          // 失敗しても画面クラッシュしないように
+          console.log('openPlace 読み出しエラー', e);
+        }
+      })();
+
+      // アンフォーカス時のクリーンアップ
+      return () => {
+        isActive = false;
+      };
+    }, []) // ★ここを [] にする！
+  );
+
+
   // --- 推薦Screenでスポットが選ばれた時の処理 ---
   const handleRecommendationSpotPress = (spot: SpotData) => {
-    
-    
+
+
     // 推薦Screenを閉じる
     setShowRecommendationScreen(false);
-    
+
     // スポットをPlaceに変換
     const newPlace: Place = {
       id: spot.id,
@@ -1092,12 +1360,12 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
       address: spot.address || '',
       rating: spot.rating
     };
-    
-  // 推薦からスポットを選択して表示（undo 対応）
-  setLastPlaces(places);
-  setLastPlacesLabel('推薦で選択');
-  setPlaces([newPlace]);
-    
+
+    // 推薦からスポットを選択して表示（undo 対応）
+    setLastPlaces(places);
+    setLastPlacesLabel('推薦で選択');
+    setPlaces([newPlace]);
+
     // 地図の中心を移動
     setRegion({
       latitude: spot.lat,
@@ -1105,7 +1373,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
       latitudeDelta: 0.01,
       longitudeDelta: 0.01,
     });
-    
+
     // 経路を描画
     drawRoute(newPlace);
   };
@@ -1147,8 +1415,8 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
             onSubmitEditing={handleSearch}
           />
           {query.trim() && (
-            <TouchableOpacity 
-              style={styles.clearBtn} 
+            <TouchableOpacity
+              style={styles.clearBtn}
               onPress={() => handleQueryChange('')}
             >
               <Text style={styles.clearBtnText}>✕</Text>
@@ -1159,394 +1427,410 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
           </TouchableOpacity>
         </View>
 
-      {/* 浮遊操作ボタン（縦スタックのFAB） */}
-      <View
-        style={[
-          styles.floatingControls,
-          {
-            bottom:
-              (!showLocalSpecialties && !navigating && places.length > 0)
-                ? (BOTTOM_LIST_HEIGHT + 24)
-                : (route ? (BOTTOM_PANEL_HEIGHT + 24) : 24),
-          },
-        ]}
-        pointerEvents="box-none"
-      >
-        <TouchableOpacity
-          style={[styles.fab, { backgroundColor: '#007AFF' }]}
-          onPress={async () => {
-            setMsg('📡 位置情報を更新中...');
-            const location = await getLocationFast();
-            if (location?.coords) {
-              const { latitude, longitude } = location.coords;
-              setMe({ lat: latitude, lng: longitude });
-              setRegion({
-                latitude,
-                longitude,
-                latitudeDelta: 0.01,
-                longitudeDelta: 0.01,
-              });
+        {/* 旧: 右側縦スタックFABを廃止し、下部パネル内に横並びへ移動 */}
 
-              // 都道府県も更新
-              try {
-                const prefecture = await getPrefectureFromCoords(latitude, longitude);
-                setCurrentPrefecture(prefecture);
-                setMsg(`🔵 更新しました (${prefecture})`);
-              } catch (error) {
-                setMsg('🔵 位置は更新されました');
-              }
-            } else setMsg('⚠️ 更新に失敗しました');
-          }}
+        {/* 上部の時間/距離表示は非表示にする。通常メッセージのみ（非ナビ時）表示 */}
+        {!navigating && msg && <Text style={styles.msg}>{msg}</Text>}
+
+
+
+        {/* 推薦Screen */}
+        <Modal
+          visible={showRecommendationScreen}
+          animationType="slide"
+          presentationStyle="fullScreen"
         >
-          <Text style={styles.fabIcon}>🔵</Text>
-        </TouchableOpacity>
+          <RecommendationScreen
+            initialLocation={me}
+            onClose={() => setShowRecommendationScreen(false)}
+            onSpotPress={handleRecommendationSpotPress}
+            userPreferences={userPreferences}
+            token={token}
+          />
+        </Modal>
 
-        <TouchableOpacity
-          style={[styles.fab, { backgroundColor: '#FF6B35' }]}
-          onPress={() => navigation?.navigate?.('RecommendationRanking', {
-            currentLocation: me,
-            onPlacesUpdate: setPlaces,
-          })}
-          disabled={!me}
+        {/* マイページモーダル */}
+        <Modal
+          visible={showMyPage}
+          animationType="slide"
+          presentationStyle="fullScreen"
         >
-          <Text style={styles.fabIcon}>🤖</Text>
-        </TouchableOpacity>
+          <MyPageScreen
+            onClose={() => setShowMyPage(false)}
+          />
+        </Modal>
 
-        <TouchableOpacity
-          style={[styles.fab, { backgroundColor: '#6C5CE7' }]}
-          onPress={() => setShowMyPage(true)}
+        {/* おすすめスポットリストモーダル */}
+        <Modal
+          visible={showRecommendedList}
+          animationType="slide"
+          presentationStyle="pageSheet"
         >
-          <Text style={styles.fabIcon}>⚙️</Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* 上部の時間/距離表示は非表示にする。通常メッセージのみ（非ナビ時）表示 */}
-      {!navigating && msg && <Text style={styles.msg}>{msg}</Text>}
-
-      
-
-      {/* 推薦Screen */}
-      <Modal 
-        visible={showRecommendationScreen}
-        animationType="slide"
-        presentationStyle="fullScreen"
-      >
-        <RecommendationScreen
-          initialLocation={me}
-          onClose={() => setShowRecommendationScreen(false)}
-          onSpotPress={handleRecommendationSpotPress}
-          userPreferences={userPreferences}
-          token={token}
-        />
-      </Modal>
-
-      {/* マイページモーダル */}
-      <Modal
-        visible={showMyPage}
-        animationType="slide"
-        presentationStyle="fullScreen"
-      >
-        <MyPageScreen
-          onClose={() => setShowMyPage(false)}
-        />
-      </Modal>
-
-      {/* おすすめスポットリストモーダル */}
-      <Modal
-        visible={showRecommendedList}
-        animationType="slide"
-        presentationStyle="pageSheet"
-      >
-        <View style={styles.recommendedListContainer}>
-          <View style={styles.recommendedListHeader}>
-            <Text style={styles.recommendedListTitle}>
-              🎯 あなたへのおすすめスポット ({recommendedSpots.length}件)
-            </Text>
-            <TouchableOpacity 
-              onPress={() => setShowRecommendedList(false)}
-              style={styles.closeButton}
-            >
-              <Text style={styles.closeButtonText}>✕</Text>
-            </TouchableOpacity>
-          </View>
-          
-          <FlatList
-            data={recommendedSpots}
-            keyExtractor={(item) => item.id}
-            renderItem={({ item }) => (
-              <TouchableOpacity 
-                style={styles.recommendedSpotItem}
-                onPress={() => {
-                  setShowRecommendedList(false);
-                  drawRoute(item);
-                  // マップの中心をそのスポットに移動
-                  if (mapRef.current) {
-                    mapRef.current.animateToRegion({
-                      latitude: item.lat,
-                      longitude: item.lng,
-                      latitudeDelta: 0.01,
-                      longitudeDelta: 0.01,
-                    });
-                  }
-                }}
-              >
-                {item.photoUrl && (
-                  <View style={{ marginBottom: 10 }}>
-                    <Image source={{ uri: item.photoUrl }} style={styles.placeImage} />
-                  </View>
-                )}
-                <View style={styles.spotHeader}>
-                  <Text style={styles.spotName}>{item.name}</Text>
-                  {item.rating && (
-                    <View style={styles.ratingContainer}>
-                      <Text style={styles.ratingText}>{formatRating(item.rating, item.userRatingCount)}</Text>
-                    </View>
-                  )}
-                </View>
-                
-                <Text style={styles.spotAddress}>{item.address}</Text>
-                
-                <View style={styles.spotDetails}>
-                  {item.cuisineType && (
-                    <Text style={styles.cuisineType}>{item.cuisineType}</Text>
-                  )}
-                  {priceLevelToYen(item.priceLevel) && (
-                    <Text style={styles.priceRange}>{priceLevelToYen(item.priceLevel)}</Text>
-                  )}
-                </View>
-                
-                {item.reasons && (
-                  <View style={styles.reasonsContainer}>
-                    {item.reasons.slice(0, 2).map((reason: string, index: number) => (
-                      <Text key={index} style={styles.reasonText}>• {reason}</Text>
-                    ))}
-                  </View>
-                )}
-              </TouchableOpacity>
-            )}
-            showsVerticalScrollIndicator={false}
-            contentContainerStyle={styles.recommendedListContent}
-          />
-        </View>
-      </Modal>
-
-      {/* ご当地グルメリストモーダル */}
-      <Modal
-        visible={showLocalSpecialties}
-        animationType="slide"
-        presentationStyle="fullScreen"
-      >
-        <View style={styles.recommendedListContainer}>
-          <View style={styles.recommendedListHeader}>
-            <Text style={styles.recommendedListTitle}>
-              🍽️ {currentPrefecture}のご当地グルメ ({localSpecialties.length}件)
-            </Text>
-            <TouchableOpacity 
-              onPress={() => setShowLocalSpecialties(false)}
-              style={styles.closeButton}
-            >
-              <Text style={styles.closeButtonText}>✕</Text>
-            </TouchableOpacity>
-          </View>
-          
-          <View style={styles.specialtyInfo}>
-            <Text style={styles.specialtyInfoText}>
-              {currentPrefecture}の代表的なご当地グルメ: {LOCAL_SPECIALTIES[currentPrefecture]?.slice(0, 5).join('、')}
-            </Text>
-          </View>
-          
-          <FlatList
-            data={localSpecialties}
-            keyExtractor={(item) => item.id}
-            renderItem={({ item, index }) => (
-              <TouchableOpacity 
-                style={styles.recommendedSpotItem}
-                onPress={() => {
-                  setShowLocalSpecialties(false);
-                  drawRoute(item);
-                  if (mapRef.current) {
-                    mapRef.current.animateToRegion({
-                      latitude: item.lat,
-                      longitude: item.lng,
-                      latitudeDelta: 0.01,
-                      longitudeDelta: 0.01,
-                    });
-                  }
-                }}
-              >
-                {/* ランクバッジ */}
-                <View style={styles.rankRow}>
-                  <Text style={[styles.rankBadge, index === 0 && styles.rank1, index === 1 && styles.rank2, index === 2 && styles.rank3]}>
-                    {index + 1}
-                  </Text>
-                </View>
-                {item.photoUrl && (
-                  <View style={{ marginBottom: 10 }}>
-                    <Image source={{ uri: item.photoUrl }} style={styles.placeImage} />
-                  </View>
-                )}
-                <View style={styles.spotHeader}>
-                  <Text style={styles.spotName}>{item.name}</Text>
-                  {item.rating && (
-                    <View style={styles.ratingContainer}>
-                      <Text style={styles.ratingText}>{formatRating(item.rating, item.userRatingCount)}</Text>
-                    </View>
-                  )}
-                </View>
-                
-                <Text style={styles.spotAddress}>{item.address}</Text>
-                
-                <View style={styles.spotDetails}>
-                  {item.cuisineType && (
-                    <Text style={styles.cuisineType}>{item.cuisineType}</Text>
-                  )}
-                  {priceLevelToYen(item.priceLevel) && (
-                    <Text style={styles.priceRange}>{priceLevelToYen(item.priceLevel)}</Text>
-                  )}
-                  {me && (
-                    <Text style={styles.distanceChip}>
-                      {(() => {
-                        try {
-                          const d = getDistance(
-                            { latitude: me.lat, longitude: me.lng },
-                            { latitude: item.lat, longitude: item.lng }
-                          );
-                          return `${(d / 1000).toFixed(1)}km`;
-                        } catch { return ''; }
-                      })()}
-                    </Text>
-                  )}
-                </View>
-              </TouchableOpacity>
-            )}
-            showsVerticalScrollIndicator={false}
-            contentContainerStyle={styles.recommendedListContent}
-          />
-        </View>
-      </Modal>
-
-      {/* AIランキングモーダル */}
-      <AIRankingModal
-        visible={showAIRanking}
-        onClose={() => setShowAIRanking(false)}
-        scores={aiScores}
-        onSelectSpot={handleAISpotSelect}
-      />
-
-      {/* 地図（標準デザイン） */}
-      <MapView
-        key={`map-${navigating ? 'nav' : 'normal'}-${me ? `${me.lat}-${me.lng}` : 'no-location'}`}
-        ref={mapRef}
-        style={{ flex: 1 }}
-        provider={PROVIDER_GOOGLE}
-        region={region}
-      >
-        {(navigating && selectedPlace ? [selectedPlace] : places).map((p) => (
-          <Marker
-            key={p.id}
-            coordinate={{ latitude: p.lat, longitude: p.lng }}
-            title={p.name}
-            description={p.address}
-            onPress={() => drawRoute(p)}
-          />
-        ))}
-
-        {route && routeProgressIndex != null ? (
-          <Polyline
-            coordinates={route.coords.slice(Math.max(0, routeProgressIndex))}
-            strokeWidth={6}
-            strokeColor="#007AFF" // これから: ブルー（通過部分は非表示）
-          />
-        ) : (
-          route && <Polyline coordinates={route.coords} strokeWidth={5} strokeColor="#007AFF" />
-        )}
-
-        {/* 現在地マーカー（SVG） */}
-        {me && me.lat && me.lng && (
-          <Marker
-            coordinate={{ latitude: me.lat, longitude: me.lng }}
-            anchor={{ x: 0.5, y: 0.5 }}
-            flat
-          >
-            <NavigationArrow rotation={deviceHeading} />
-          </Marker>
-        )}
-      </MapView>
-
-      {/* 下部パネル */}
-      <View style={styles.bottom}>
-        {route && (
-          <>
-            {/* 走行モード切替（案内前のみ表示） */}
-            {!navigating && (
-              <View style={styles.modeBar}>
-                {([
-                  { key: 'WALK', label: '徒歩', emoji: MODE_EMOJI.WALK },
-                  { key: 'BICYCLE', label: '自転車', emoji: MODE_EMOJI.BICYCLE },
-                  { key: 'DRIVE', label: '車', emoji: MODE_EMOJI.DRIVE },
-                ] as { key: TravelMode; label: string; emoji: string }[]).map(({ key, label, emoji }) => (
-                  <TouchableOpacity
-                    key={key}
-                    style={[styles.modeBtn, travelMode === key && styles.modeBtnActive]}
-                    onPress={() => setTravelMode(key)}
-                  >
-                    <View style={styles.modeBtnRow}>
-                      <Text style={[styles.modeEmoji, travelMode === key && styles.modeEmojiActive]}>{emoji}</Text>
-                      <Text style={[styles.modeBtnText, travelMode === key && styles.modeBtnTextActive]}>{label}</Text>
-                    </View>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            )}
-            
-            <View style={styles.routeInfoRow}>
-              <Text style={styles.routeEmoji}>{MODE_EMOJI[travelMode]}</Text>
-              <Text style={styles.routeText}>
-                {buildNavInfo(route, navigating, remainingDistanceMeters, remainingDurationSec)}
+          <View style={styles.recommendedListContainer}>
+            <View style={styles.recommendedListHeader}>
+              <Text style={styles.recommendedListTitle}>
+                🎯 あなたへのおすすめスポット ({recommendedSpots.length}件)
               </Text>
+              <TouchableOpacity
+                onPress={() => setShowRecommendedList(false)}
+                style={styles.closeButton}
+              >
+                <Text style={styles.closeButtonText}>✕</Text>
+              </TouchableOpacity>
             </View>
-            <View style={styles.navBtns}>
-              {!navigating ? (
-                <TouchableOpacity style={[styles.navBtn, { backgroundColor: '#007AFF' }]} onPress={startNavigation}>
-                  <Text style={styles.navBtnText}>案内開始</Text>
-                </TouchableOpacity>
-              ) : (
-                <TouchableOpacity 
-                  style={[styles.navBtn, { backgroundColor: '#FF3B30' }]} 
+
+            <FlatList
+              data={recommendedSpots}
+              keyExtractor={(item) => item.id}
+              renderItem={({ item }) => (
+                <TouchableOpacity
+                  style={styles.recommendedSpotItem}
                   onPress={() => {
-                    
-                    stopNavigation();
+                    setShowRecommendedList(false);
+                    drawRoute(item);
+                    // マップの中心をそのスポットに移動
+                    if (mapRef.current) {
+                      mapRef.current.animateToRegion({
+                        latitude: item.lat,
+                        longitude: item.lng,
+                        latitudeDelta: 0.01,
+                        longitudeDelta: 0.01,
+                      });
+                    }
                   }}
                 >
-                  <Text style={styles.navBtnText}>案内終了</Text>
-                </TouchableOpacity>
-              )}
-            </View>
-          </>
-        )}
-        {!showLocalSpecialties && !navigating && places.length > 0 && (
-          <View style={styles.bottomListContainer}>
-            <FlatList
-              horizontal
-              data={places}
-              keyExtractor={(i) => i.id}
-              renderItem={({ item }) => (
-                <TouchableOpacity style={styles.card} onPress={() => drawRoute(item)}>
                   {item.photoUrl && (
-                    <Image source={{ uri: item.photoUrl }} style={styles.placeImageSmall} />
+                    <View style={{ marginBottom: 10 }}>
+                      <Image source={{ uri: item.photoUrl }} style={styles.placeImage} />
+                    </View>
                   )}
-            <Text style={styles.name} numberOfLines={1} allowFontScaling={false}>{item.name}</Text>
-            {item.address && <Text style={styles.addr} numberOfLines={1} allowFontScaling={false}>{item.address}</Text>}
-            {item.rating && <Text style={styles.cardRating} allowFontScaling={false}>{formatRating(item.rating, item.userRatingCount)}</Text>}
+                  <View style={styles.spotHeader}>
+                    <Text style={styles.spotName}>{item.name}</Text>
+                    {item.rating && (
+                      <View style={styles.ratingContainer}>
+                        <Text style={styles.ratingText}>{formatRating(item.rating, item.userRatingCount)}</Text>
+                      </View>
+                    )}
+                  </View>
+
+                  <Text style={styles.spotAddress}>{item.address}</Text>
+
+                  <View style={styles.spotDetails}>
+                    {item.cuisineType && (
+                      <Text style={styles.cuisineType}>{item.cuisineType}</Text>
+                    )}
+                    {priceLevelToYen(item.priceLevel) && (
+                      <Text style={styles.priceRange}>{priceLevelToYen(item.priceLevel)}</Text>
+                    )}
+                  </View>
+
+                  {item.reasons && (
+                    <View style={styles.reasonsContainer}>
+                      {item.reasons.slice(0, 2).map((reason: string, index: number) => (
+                        <Text key={index} style={styles.reasonText}>• {reason}</Text>
+                      ))}
+                    </View>
+                  )}
                 </TouchableOpacity>
               )}
-              showsHorizontalScrollIndicator={false}
+              showsVerticalScrollIndicator={false}
               contentContainerStyle={styles.recommendedListContent}
             />
           </View>
+        </Modal>
+
+        {/* ご当地グルメリストモーダル */}
+        <Modal
+          visible={showLocalSpecialties}
+          animationType="slide"
+          presentationStyle="fullScreen"
+        >
+          <View style={styles.recommendedListContainer}>
+            <View style={styles.recommendedListHeader}>
+              <Text style={styles.recommendedListTitle}>
+                🍽️ {currentPrefecture}のご当地グルメ ({localSpecialties.length}件)
+              </Text>
+              <TouchableOpacity
+                onPress={() => setShowLocalSpecialties(false)}
+                style={styles.closeButton}
+              >
+                <Text style={styles.closeButtonText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.specialtyInfo}>
+              <Text style={styles.specialtyInfoText}>
+                {currentPrefecture}の代表的なご当地グルメ: {LOCAL_SPECIALTIES[currentPrefecture]?.slice(0, 5).join('、')}
+              </Text>
+            </View>
+
+            <FlatList
+              data={localSpecialties}
+              keyExtractor={(item) => item.id}
+              renderItem={({ item, index }) => (
+                <TouchableOpacity
+                  style={styles.recommendedSpotItem}
+                  onPress={() => {
+                    setShowLocalSpecialties(false);
+                    drawRoute(item);
+                    if (mapRef.current) {
+                      mapRef.current.animateToRegion({
+                        latitude: item.lat,
+                        longitude: item.lng,
+                        latitudeDelta: 0.01,
+                        longitudeDelta: 0.01,
+                      });
+                    }
+                  }}
+                >
+                  {/* ランクバッジ */}
+                  <View style={styles.rankRow}>
+                    <Text style={[styles.rankBadge, index === 0 && styles.rank1, index === 1 && styles.rank2, index === 2 && styles.rank3]}>
+                      {index + 1}
+                    </Text>
+                  </View>
+                  {item.photoUrl && (
+                    <View style={{ marginBottom: 10 }}>
+                      <Image source={{ uri: item.photoUrl }} style={styles.placeImage} />
+                    </View>
+                  )}
+                  <View style={styles.spotHeader}>
+                    <Text style={styles.spotName}>{item.name}</Text>
+                    {item.rating && (
+                      <View style={styles.ratingContainer}>
+                        <Text style={styles.ratingText}>{formatRating(item.rating, item.userRatingCount)}</Text>
+                      </View>
+                    )}
+                  </View>
+
+                  <Text style={styles.spotAddress}>{item.address}</Text>
+
+                  <View style={styles.spotDetails}>
+                    {item.cuisineType && (
+                      <Text style={styles.cuisineType}>{item.cuisineType}</Text>
+                    )}
+                    {priceLevelToYen(item.priceLevel) && (
+                      <Text style={styles.priceRange}>{priceLevelToYen(item.priceLevel)}</Text>
+                    )}
+                    {me && (
+                      <Text style={styles.distanceChip}>
+                        {(() => {
+                          try {
+                            const d = getDistance(
+                              { latitude: me.lat, longitude: me.lng },
+                              { latitude: item.lat, longitude: item.lng }
+                            );
+                            return `${(d / 1000).toFixed(1)}km`;
+                          } catch { return ''; }
+                        })()}
+                      </Text>
+                    )}
+                  </View>
+                </TouchableOpacity>
+              )}
+              showsVerticalScrollIndicator={false}
+              contentContainerStyle={styles.recommendedListContent}
+            />
+          </View>
+        </Modal>
+
+        {/* AIランキングモーダル */}
+        <AIRankingModal
+          visible={showAIRanking}
+          onClose={() => setShowAIRanking(false)}
+          scores={aiScores}
+          onSelectSpot={handleAISpotSelect}
+        />
+
+        {/* 地図（標準デザイン） */}
+        <MapView
+          key="map"
+          ref={mapRef}
+          style={{ flex: 1 }}
+          provider={PROVIDER_GOOGLE}
+          region={region}
+          showsUserLocation={true}
+        >
+          {places.map((p) => (
+            <Marker
+              key={p.id}
+              coordinate={{ latitude: p.lat, longitude: p.lng }}
+              title={p.name}
+              description={p.address}
+              onPress={() => drawRoute(p)}
+            />
+          ))}
+
+          {route && routeProgressIndex != null ? (
+            <Polyline
+              coordinates={route.coords.slice(Math.max(0, routeProgressIndex))}
+              strokeWidth={6}
+              strokeColor="#007AFF" // これから: ブルー（通過部分は非表示）
+            />
+          ) : (
+            route && <Polyline coordinates={route.coords} strokeWidth={5} strokeColor="#007AFF" />
+          )}
+
+          {/* 現在地カスタムマーカーは非表示化（デフォルトのshowsUserLocationのみ使用） */}
+        </MapView>
+
+        {/* 右下縦並びアイコン群（店舗表示・経路案内中は非表示） */}
+        {(!selectedPlace && !route && !navigating && !showAIRanking && places.length === 0) && (
+          <View style={styles.floatingControls} pointerEvents="box-none">
+            <TouchableOpacity
+              style={[styles.fab, { backgroundColor: '#007AFF' }]}
+              onPress={async () => {
+                setMsg('📡 位置情報を更新中...');
+                const location = await getLocationFast();
+                if (location?.coords) {
+                  const { latitude, longitude } = location.coords;
+                  setMe({ lat: latitude, lng: longitude });
+                  setRegion({
+                    latitude,
+                    longitude,
+                    latitudeDelta: 0.01,
+                    longitudeDelta: 0.01,
+                  });
+                  try {
+                    const prefecture = await getPrefectureFromCoords(latitude, longitude);
+                    setCurrentPrefecture(prefecture);
+                    setMsg(`🔵 更新しました (${prefecture})`);
+                  } catch {
+                    setMsg('🔵 位置は更新されました');
+                  }
+                } else setMsg('⚠️ 更新に失敗しました');
+              }}
+            >
+              <Text style={styles.fabIcon}>🔵</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.fab, { backgroundColor: '#FF6B35' }]}
+              onPress={() => navigation?.navigate?.('RecommendationRanking', {
+                currentLocation: me,
+                onPlacesUpdate: setPlaces,
+              })}
+              disabled={!me}
+            >
+              <Text style={styles.fabIcon}>🤖</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.fab, { backgroundColor: '#6C5CE7' }]}
+              onPress={() => setShowMyPage(true)}
+            >
+              <Text style={styles.fabIcon}>⚙️</Text>
+            </TouchableOpacity>
+          </View>
         )}
+
+        {/* 下部パネル */}
+        <View style={styles.bottom}>
+          {route && (
+            <>
+              {/* 走行モード切替（案内前のみ表示） */}
+              {!navigating && (
+                <View style={styles.modeBar}>
+                  {([
+                    { key: 'WALK', label: '徒歩', emoji: MODE_EMOJI.WALK },
+                    { key: 'BICYCLE', label: '自転車', emoji: MODE_EMOJI.BICYCLE },
+                    { key: 'DRIVE', label: '車', emoji: MODE_EMOJI.DRIVE },
+                  ] as { key: TravelMode; label: string; emoji: string }[]).map(({ key, label, emoji }) => (
+                    <TouchableOpacity
+                      key={key}
+                      style={[styles.modeBtn, travelMode === key && styles.modeBtnActive]}
+                      onPress={() => setTravelMode(key)}
+                    >
+                      <View style={styles.modeBtnRow}>
+                        <Text style={[styles.modeEmoji, travelMode === key && styles.modeEmojiActive]}>{emoji}</Text>
+                        <Text style={[styles.modeBtnText, travelMode === key && styles.modeBtnTextActive]}>{label}</Text>
+                      </View>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              )}
+
+              {/* 目的地の写真カード（ナビ中に店舗がわかるように表示） */}
+              {selectedPlace && (
+                <View style={{ paddingHorizontal: 16, marginBottom: 8 }}>
+                  {selectedPlace.photoUrl && (
+                    <Image source={{ uri: selectedPlace.photoUrl }} style={styles.navPlaceImage} />
+                  )}
+                  <Text style={styles.navPlaceName} numberOfLines={1} allowFontScaling={false}>{selectedPlace.name}</Text>
+                  {selectedPlace.address && (
+                    <Text style={styles.navPlaceAddr} numberOfLines={1} allowFontScaling={false}>{selectedPlace.address}</Text>
+                  )}
+                </View>
+              )}
+
+              <View style={styles.routeInfoRow}>
+                <Text style={styles.routeEmoji}>{MODE_EMOJI[travelMode]}</Text>
+                <Text style={styles.routeText}>
+                  {buildNavInfo(route, navigating, remainingDistanceMeters, remainingDurationSec)}
+                </Text>
+              </View>
+              <View style={styles.navBtns}>
+                {!navigating ? (
+                  <TouchableOpacity style={[styles.navBtn, { backgroundColor: '#007AFF' }]} onPress={startNavigation}>
+                    <Text style={styles.navBtnText}>案内開始</Text>
+                  </TouchableOpacity>
+                ) : (
+                  <TouchableOpacity
+                    style={[styles.navBtn, { backgroundColor: '#FF3B30' }]}
+                    onPress={() => {
+
+                      stopNavigation();
+                    }}
+                  >
+                    <Text style={styles.navBtnText}>案内終了</Text>
+                  </TouchableOpacity>
+                )}
+                {/* Googleマップ連携は非表示 */}
+              </View>
+            </>
+          )}
+          {!showLocalSpecialties && !navigating && !route && places.length > 0 && (
+            <View style={styles.bottomListContainer}>
+              <FlatList
+                horizontal
+                data={places}
+                keyExtractor={(i) => i.id}
+                renderItem={({ item }) => (
+                  <TouchableOpacity style={styles.card} onPress={() => drawRoute(item)}>
+                    {item.photoUrl && (
+                      <Image source={{ uri: item.photoUrl }} style={styles.placeImageSmall} />
+                    )}
+                    <Text style={styles.name} numberOfLines={1} allowFontScaling={false}>{item.name}</Text>
+                    {item.address && <Text style={styles.addr} numberOfLines={1} allowFontScaling={false}>{item.address}</Text>}
+                    {item.rating && <Text style={styles.cardRating} allowFontScaling={false}>{formatRating(item.rating, item.userRatingCount)}</Text>}
+                    <View style={styles.saveRow}>
+                      <TouchableOpacity
+                        style={[styles.saveBtn, { backgroundColor: '#ff4d4f' }]}
+                        onPress={async () => {
+                          await addFavorite({
+                            id: item.id,
+                            name: item.name,
+                            lat: item.lat,
+                            lng: item.lng,
+                            address: item.address,
+                            rating: item.rating,
+                            photoUrl: item.photoUrl,
+                            priceLevel: item.priceLevel,
+                          }, token || undefined);
+                          setMsg('❤️ お気に入りに保存しました');
+                          setTimeout(() => setMsg(''), 2000);
+                        }}
+                      >
+                        <Text style={styles.saveIcon}>❤️</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </TouchableOpacity>
+                )}
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.recommendedListContent}
+              />
+            </View>
+          )}
+        </View>
       </View>
-    </View>
     </TouchableWithoutFeedback>
   );
 }
@@ -1555,21 +1839,21 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
 const styles = StyleSheet.create({
   searchBar: {
     position: 'absolute', top: 50, left: 10, right: 10, zIndex: 10,
-    flexDirection: 'row', backgroundColor: '#fff', borderRadius: 8, padding: 6,
+    flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', borderRadius: 10, padding: 8, minHeight: 50,
     shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 5, elevation: 6,
   },
-  input: { flex: 1, fontSize: 16, paddingHorizontal: 8 },
-  clearBtn: { padding: 6, justifyContent: 'center' },
-  clearBtnText: { color: '#666', fontSize: 16 },
-  btn: { backgroundColor: '#007AFF', borderRadius: 6, paddingHorizontal: 14, justifyContent: 'center' },
-  btnText: { color: '#fff', fontWeight: 'bold' },
+  input: { flex: 1, fontSize: 17, paddingHorizontal: 10, paddingVertical: 8 },
+  clearBtn: { padding: 8, justifyContent: 'center' },
+  clearBtnText: { color: '#666', fontSize: 17 },
+  btn: { backgroundColor: '#007AFF', borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8, justifyContent: 'center' },
+  btnText: { color: '#fff', fontWeight: 'bold', fontSize: 15 },
   msg: { position: 'absolute', top: 100, left: 12, right: 12, backgroundColor: '#e8f4ff', padding: 12, borderRadius: 10, zIndex: 10, textAlign: 'center', color: '#0066cc', fontSize: 20, fontWeight: '700' },
   bottom: { position: 'absolute', bottom: 0, left: 0, right: 0, backgroundColor: 'rgba(255,255,255,0.95)', paddingVertical: 12 },
   modeBar: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, marginBottom: 8 },
   modeBtn: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, backgroundColor: '#eef2f7' },
   modeBtnActive: { backgroundColor: '#007AFF22', borderWidth: 1, borderColor: '#007AFF' },
   modeBtnText: { color: '#41546b', fontWeight: '600' },
-  modeBtnTextActive: { color: '#007AFF' },  
+  modeBtnTextActive: { color: '#007AFF' },
   modeBtnRow: { flexDirection: 'row', alignItems: 'center' },
   routeInfoRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
   modeEmoji: { marginRight: 6, fontSize: 14 },
@@ -1580,12 +1864,19 @@ const styles = StyleSheet.create({
   navBtns: { flexDirection: 'row', justifyContent: 'center', marginBottom: 8 },
   navBtn: { borderRadius: 10, paddingVertical: 10, paddingHorizontal: 40 },
   navBtnText: { color: '#fff', textAlign: 'center', fontWeight: '700' },
-  card: { width: CARD_WIDTH, marginHorizontal: 10, padding: 12, backgroundColor: '#fff', borderRadius: 10, elevation: 3 },
-  name: { fontWeight: '700', fontSize: 18 },
+  card: { width: CARD_WIDTH, marginHorizontal: 10, padding: 12, paddingBottom: 14, backgroundColor: '#fff', borderRadius: 10, elevation: 3, overflow: 'hidden' },
+  name: { fontWeight: '700', fontSize: 16 },
   addr: { color: '#555', marginTop: 2, fontSize: 14 },
+  // ナビ用 目的地カード
+  navPlaceImage: { width: '100%', height: 140, borderRadius: 10, backgroundColor: '#eee', marginBottom: 6 },
+  navPlaceName: { fontWeight: '800', fontSize: 18, color: '#1a1a1a' },
+  navPlaceAddr: { color: '#6c757d', marginTop: 2, fontSize: 13 },
   placeImage: { width: '100%', height: 140, borderRadius: 8, backgroundColor: '#eee' },
-  placeImageSmall: { width: '100%', height: IMAGE_HEIGHT, borderRadius: 10, backgroundColor: '#eee', marginBottom: 10 },
-  cardRating: { marginTop: 4, color: '#1a1a1a' },
+  placeImageSmall: { width: '100%', height: Math.max(70, IMAGE_HEIGHT - 24), borderRadius: 10, backgroundColor: '#eee', marginBottom: 6 },
+  cardRating: { marginTop: 2, color: '#1a1a1a' },
+  saveRow: { flexDirection: 'row', alignSelf: 'flex-end', gap: 6, marginTop: 6, marginBottom: 2 },
+  saveBtn: { width: 28, height: 28, borderRadius: 7, justifyContent: 'center', alignItems: 'center' },
+  saveIcon: { color: '#fff', fontSize: 13, fontWeight: '700' },
   locationBtn: {
     position: 'absolute', bottom: 120, right: 20,
     width: 50, height: 50, backgroundColor: '#007AFF',
@@ -1598,7 +1889,7 @@ const styles = StyleSheet.create({
     position: 'absolute',
     bottom: 24,
     right: 16,
-    zIndex: 20,
+    zIndex: 5,
     alignItems: 'center',
     justifyContent: 'center',
     // pointerEventsはJSXで設定
@@ -1631,8 +1922,8 @@ const styles = StyleSheet.create({
     borderRadius: 25, justifyContent: 'center', alignItems: 'center',
     shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 8, elevation: 8, zIndex: 10,
   },
-  localSpecialtyLabel: { 
-    fontSize: 22, color: 'white', fontWeight: '600', marginTop: 0 
+  localSpecialtyLabel: {
+    fontSize: 22, color: 'white', fontWeight: '600', marginTop: 0
   },
   aiRankingBtn: {
     position: 'absolute', bottom: 330, right: 20,
@@ -1640,8 +1931,8 @@ const styles = StyleSheet.create({
     borderRadius: 25, justifyContent: 'center', alignItems: 'center',
     shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 8, elevation: 8, zIndex: 10,
   },
-  aiRankingBtnText: { 
-    fontSize: 22, color: 'white', fontWeight: '600' 
+  aiRankingBtnText: {
+    fontSize: 22, color: 'white', fontWeight: '600'
   },
   recommendationRankingBtn: {
     position: 'absolute', bottom: 400, right: 20,
@@ -1649,8 +1940,8 @@ const styles = StyleSheet.create({
     borderRadius: 25, justifyContent: 'center', alignItems: 'center',
     shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 8, elevation: 8, zIndex: 10,
   },
-  recommendationRankingBtnText: { 
-    fontSize: 22, color: 'white', fontWeight: '600' 
+  recommendationRankingBtnText: {
+    fontSize: 22, color: 'white', fontWeight: '600'
   },
   myPageBtn: {
     position: 'absolute', bottom: 470, right: 20,
@@ -1688,7 +1979,7 @@ const styles = StyleSheet.create({
   undoText: { color: '#333', fontSize: 14, flex: 1, marginRight: 10 },
   undoBtn: { backgroundColor: '#FF6B35', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 6 },
   undoBtnText: { color: '#fff', fontWeight: '700' },
-  
+
   // おすすめスポットリスト用スタイル
   recommendedListContainer: {
     flex: 1,
@@ -1771,12 +2062,15 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     textAlignVertical: 'center',
     fontWeight: '800',
-    color: '#fff',
-    backgroundColor: '#9e9e9e',
+    color: '#343a40',
+    backgroundColor: '#f1f3f5',
+    borderWidth: 1,
+    borderColor: '#e9ecef',
   },
-  rank1: { backgroundColor: '#FFD700' }, // gold
-  rank2: { backgroundColor: '#C0C0C0' }, // silver
-  rank3: { backgroundColor: '#CD7F32' }, // bronze
+  // 上位3件は背景は共通のまま、枠線だけアクセントにして視認性と落ち着きを両立
+  rank1: { borderColor: '#4C9AFF' },
+  rank2: { borderColor: '#7AA2E3' },
+  rank3: { borderColor: '#A7C0F2' },
   spotAddress: {
     fontSize: 14,
     color: '#6c757d',
@@ -1835,5 +2129,41 @@ const styles = StyleSheet.create({
     color: '#6c757d',
     textAlign: 'center',
     lineHeight: 20,
+  },
+  // 新: 下部アクションバー
+  actionRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    marginTop: 8,
+  },
+  actionBtn: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+
+  actionIcon: { fontSize: 22, color: '#fff', fontWeight: '600' },
+  actionLabelOverlay: {
+    position: 'absolute',
+    top: -16,
+    left: '50%',
+    transform: [{ translateX: -20 }],
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 12,
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: '600',
+    overflow: 'hidden',
   },
 });

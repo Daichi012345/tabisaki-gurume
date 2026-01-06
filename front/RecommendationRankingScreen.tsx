@@ -11,13 +11,37 @@ import {
 } from 'react-native';
 import * as Location from 'expo-location';
 import AIRankingModal from './AIRankingModal';
-import { LOCAL_SPECIALTIES_KEYWORDS } from '../utils/aiScoring';
-import { calculateAIScore, SpotScore } from '../utils/aiScoring';
-import { ensureGoogleApiKey } from '../utils/config';
+import { LOCAL_SPECIALTIES_KEYWORDS, GENRE_SYNONYMS } from '../utils/aiScoring';
+import { calculateAIScore, SpotScore, isLocalPlace } from '../utils/aiScoring';
+import { ensureGoogleApiKey, buildApiUrl, BACKEND_BASE_URL, HOTPEPPER_PUBLIC_API_KEY } from '../utils/config';
 import { useAuth } from '../utils/auth';
 import { apiCall } from '../utils/api';
 
 const API_KEY: string = ensureGoogleApiKey();
+
+// priceLevel を表示用の記号に変換
+const priceLevelToYen = (level?: string | number): string | undefined => {
+  if (typeof level === 'number') {
+    const map = ['¥', '¥', '¥¥', '¥¥¥', '¥¥¥¥'];
+    return map[Math.max(0, Math.min(4, Math.floor(level)))] ?? undefined;
+  } else if (typeof level === 'string') {
+    switch (level) {
+      case 'PRICE_LEVEL_FREE':
+        return '無料';
+      case 'PRICE_LEVEL_INEXPENSIVE':
+        return '¥';
+      case 'PRICE_LEVEL_MODERATE':
+        return '¥¥';
+      case 'PRICE_LEVEL_EXPENSIVE':
+        return '¥¥¥';
+      case 'PRICE_LEVEL_VERY_EXPENSIVE':
+        return '¥¥¥¥';
+      default:
+        return undefined;
+    }
+  }
+  return undefined;
+};
 
 // ---------- 型定義 ----------
 type Place = {
@@ -29,10 +53,40 @@ type Place = {
   vicinity?: string;
   rating?: number;
   user_ratings_total?: number;
-  price_level?: number;
-  types?: string[];
+  price_level?: number; // 旧互換
+  priceLevel?: string | number; // Google Places v1 の priceLevel（enum or number）
+  priceRange?: string; // 表示用（¥〜¥¥¥¥）
+  hpGenre?: string; // HotPepperの種別（ジャンル名）
+  hpUrl?: string; // HotPepper予約/詳細ページURL
+  phoneNumber?: string; // 電話番号（Google Places Details）
+  types?: string[]
   reasons?: string[];
   photoUrl?: string;
+  openNow?: boolean;
+};
+// HotPepper検索用に店名を正規化
+const normalizeNameForHotPepper = (name: string): string => {
+  let s = name.trim();
+  // 店名の一般的な後置語を削除（精度向上）
+  s = s.replace(/[\s　]*(本場|本館|別館|関連棟|東部市場|中央市場|中央卸売市場|市場|スタンド|酒場|居酒屋|食堂|食事処|レストラン|カフェ|店|本店|支店|梅田店|大阪店)$/u, '');
+  // 記号類を除去
+  s = s.replace(/[\(\)\[\]【】『』“”"'・・]/g, '');
+  return s;
+};
+
+// HotPepperの検索URLを作成（name優先、ダメならkeywordに切替）
+const buildHotPepperUrl = (key: string, opts: { name?: string; keyword?: string; lat: number; lng: number; range?: number }) => {
+  const base = 'https://webservice.recruit.co.jp/hotpepper/gourmet/v1/';
+  const params = new URLSearchParams();
+  params.set('key', key);
+  if (opts.name) params.set('name', opts.name);
+  if (opts.keyword) params.set('keyword', opts.keyword);
+  params.set('lat', String(opts.lat));
+  params.set('lng', String(opts.lng));
+  params.set('range', String(opts.range ?? 3));
+  params.set('count', '1');
+  params.set('format', 'json');
+  return `${base}?${params.toString()}`;
 };
 
 type UserPreferences = {
@@ -42,6 +96,9 @@ type UserPreferences = {
   atmospherePreference?: string;
   groupSize?: number;
   occasion?: string;
+  favoriteGenres?: string[]; // DB返却に合わせ追加
+  priceRange?: string; // DB側の価格記号
+  preferredDistance?: number;
 };
 
 // ---------- 高速位置取得 ----------
@@ -91,7 +148,12 @@ async function getPrefectureFromCoords(lat: number, lng: number): Promise<string
 }
 
 // ---------- Places API検索 ----------
-async function searchPlaces(query: string, lat: number, lng: number): Promise<Place[]> {
+async function searchPlaces(
+  query: string,
+  lat: number,
+  lng: number,
+  opts?: { radius?: number; max?: number }
+): Promise<Place[]> {
   if (!API_KEY) throw new Error('Google Maps API キーが設定されていません');
 
   const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
@@ -99,17 +161,17 @@ async function searchPlaces(query: string, lat: number, lng: number): Promise<Pl
     headers: {
       'Content-Type': 'application/json',
       'X-Goog-Api-Key': API_KEY,
-      'X-Goog-FieldMask': 'places.id,places.name,places.displayName,places.location,places.rating,places.userRatingCount,places.priceLevel,places.types,places.formattedAddress,places.photos'
+      'X-Goog-FieldMask': 'places.id,places.name,places.displayName,places.location,places.rating,places.userRatingCount,places.priceLevel,places.types,places.currentOpeningHours.openNow,places.formattedAddress,places.photos'
     },
     body: JSON.stringify({
       textQuery: query,
       locationBias: {
         circle: {
           center: { latitude: lat, longitude: lng },
-          radius: 5000
+          radius: opts?.radius ?? 5000
         }
       },
-      maxResultCount: 20
+      maxResultCount: opts?.max ?? 20
     })
   });
 
@@ -128,10 +190,149 @@ async function searchPlaces(query: string, lat: number, lng: number): Promise<Pl
       rating: p.rating,
       user_ratings_total: p.userRatingCount,
       price_level: p.priceLevel,
+      priceLevel: p.priceLevel,
+      priceRange: priceLevelToYen(p.priceLevel),
       types: p.types,
+      openNow: p.currentOpeningHours?.openNow,
       photoUrl,
     } as Place;
   }) || [];
+}
+
+// Places Details から不足している priceLevel を補完
+async function enrichPlacesWithPriceLevel(places: Place[]): Promise<Place[]> {
+  const key = API_KEY;
+  if (!key) return places;
+
+  const targets = places.filter(p => p.priceLevel == null);
+  if (targets.length === 0) return places;
+
+  const fetchOne = async (pid: string) => {
+    try {
+      const bareId = pid.startsWith('places/') ? pid.replace(/^places\//, '') : pid;
+      const url = `https://places.googleapis.com/v1/places/${encodeURIComponent(bareId)}?languageCode=ja`;
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'X-Goog-Api-Key': key,
+          'X-Goog-FieldMask': 'priceLevel',
+        },
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data?.priceLevel ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  // 直列でも可だが、軽く並列（同時5件）で取得
+  const concurrency = 5;
+  let idx = 0;
+  const updateMap: Record<string, any> = {};
+  const workers = new Array(concurrency).fill(0).map(async () => {
+    while (idx < targets.length) {
+      const cur = targets[idx++];
+      const val = await fetchOne(cur.id);
+      if (val != null) {
+        updateMap[cur.id] = val;
+      }
+    }
+  });
+  await Promise.all(workers);
+
+  if (Object.keys(updateMap).length === 0) return places;
+
+  return places.map(p => {
+    if (updateMap[p.id] == null) return p;
+    const pl = updateMap[p.id];
+    return { ...p, priceLevel: pl, priceRange: priceLevelToYen(pl) };
+  });
+}
+
+// Hot Pepper API 経由で平均予算を補完
+async function enrichPlacesWithHotPepperBudget(places: Place[], lat: number, lng: number): Promise<Place[]> {
+  const enriched = [...places];
+  const targets = enriched.filter(p => !p.priceRange);
+  if (targets.length === 0) return enriched;
+  const canCallBackend = !!BACKEND_BASE_URL;
+  const canCallDirect = !!HOTPEPPER_PUBLIC_API_KEY;
+  if (!canCallBackend && !canCallDirect) {
+    console.warn('[HotPepper] BACKEND_BASE_URL と EXPO_PUBLIC_HOTPEPPER_API_KEY が未設定のため価格補完不可');
+  }
+  const fetchOne = async (p: Place) => {
+    try {
+      let pr: string | null = null;
+      let genre: string | null = null;
+      let hpUrl: string | null = null;
+      let phone: string | null = null;
+      if (canCallBackend) {
+        const url = buildApiUrl(`/api/price?name=${encodeURIComponent(p.name)}&lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}`);
+        const r = await fetch(url);
+        if (r.ok) {
+          const data = await r.json();
+          pr = data?.priceRange || null;
+          genre = data?.genre || null;
+          hpUrl = data?.url || null;
+        }
+      }
+      // バックエンドでpriceだけ取得できた場合、ジャンルが未設定なら軽く直接取得する
+      if (pr && !genre && canCallDirect) {
+        const normalized = normalizeNameForHotPepper(p.name);
+        const hpUrlG = buildHotPepperUrl(HOTPEPPER_PUBLIC_API_KEY, { name: normalized || p.name, lat, lng, range: 4 });
+        const rg = await fetch(hpUrlG);
+        if (rg.ok) {
+          const jg = await rg.json();
+          const shopg = Array.isArray(jg.results?.shop) ? jg.results.shop[0] : undefined;
+          genre = (shopg?.genre?.name as string | undefined) || (shopg?.genre?.catch as string | undefined) || null;
+        }
+      }
+      // フォールバック: 直接 Hot Pepper API を叩く
+      if (!pr && canCallDirect) {
+        const normalized = normalizeNameForHotPepper(p.name);
+        // 1回目: name検索（範囲やや広め）
+        const hpUrl1 = buildHotPepperUrl(HOTPEPPER_PUBLIC_API_KEY, { name: normalized || p.name, lat, lng, range: 4 });
+        const r1 = await fetch(hpUrl1);
+        if (r1.ok) {
+          const j1 = await r1.json();
+          const shop1 = Array.isArray(j1.results?.shop) ? j1.results.shop[0] : undefined;
+          pr = (shop1?.budget?.name as string | undefined) || null;
+          genre = (shop1?.genre?.name as string | undefined) || (shop1?.genre?.catch as string | undefined) || null;
+          hpUrl = (shop1?.urls?.pc as string | undefined) || hpUrl;
+        }
+        // 2回目: キーワード検索（市場系や一般名詞にもヒットさせる）
+        if (!pr) {
+          const keyword = normalized || p.name;
+          const hpUrl2 = buildHotPepperUrl(HOTPEPPER_PUBLIC_API_KEY, { keyword, lat, lng, range: 5 });
+          const r2 = await fetch(hpUrl2);
+          if (r2.ok) {
+            const j2 = await r2.json();
+            const shop2 = Array.isArray(j2.results?.shop) ? j2.results.shop[0] : undefined;
+            pr = (shop2?.budget?.name as string | undefined) || null;
+            genre = (shop2?.genre?.name as string | undefined) || (shop2?.genre?.catch as string | undefined) || genre;
+            hpUrl = (shop2?.urls?.pc as string | undefined) || hpUrl;
+          }
+        }
+      }
+      if (pr) {
+        console.log(`[HotPepper] priceRange取得: ${p.name} -> ${pr}`);
+      } else {
+        console.log(`[HotPepper] 取得失敗/該当なし: ${p.name}`);
+      }
+      // 種別（ジャンル）のログは非表示
+      if (pr) p.priceRange = pr;
+      if (genre) p.hpGenre = genre;
+      if (hpUrl) p.hpUrl = hpUrl;
+      return p.priceRange || null;
+    } catch { return null; }
+  };
+  for (let i = 0; i < targets.length; i++) {
+    const pr = await fetchOne(targets[i]);
+    if (pr) {
+      targets[i].priceRange = pr;
+    }
+  }
+  return enriched;
 }
 
 // ---------- メインコンポーネント ----------
@@ -163,6 +364,8 @@ export default function RecommendationRankingScreen({
   const [rankingTitle, setRankingTitle] = useState<string | undefined>(undefined);
   const [rankingDescription, setRankingDescription] = useState<string | undefined>(undefined);
   const [rankingReasoningTitle, setRankingReasoningTitle] = useState<string | undefined>(undefined);
+  // ランキングモード（AI / ご当地）
+  const [rankingMode, setRankingMode] = useState<'ai' | 'local' | undefined>(undefined);
 
   // 初期化
   useEffect(() => {
@@ -181,6 +384,17 @@ export default function RecommendationRankingScreen({
     } catch (error) {
       console.error('都道府県取得失敗:', error);
     }
+  };
+
+  // 価格記号→内部の価格帯表記へ変換（AIスコア用）
+  const mapPriceToRange = (priceSymbol: string): string => {
+    const priceMap: Record<string, string> = {
+      '¥': '～1000円',
+      '¥¥': '～2000円',
+      '¥¥¥': '～3000円',
+      '¥¥¥¥': '5000円～'
+    };
+    return priceMap[priceSymbol] || '～2000円';
   };
 
   const loadUserPreferences = async () => {
@@ -242,7 +456,7 @@ export default function RecommendationRankingScreen({
     setMsg('🍽️ ご当地グルメを検索中...');
 
     try {
-      // 都道府県ごとの代表的なご当地キーワードを使用して精度を上げる
+      // 都道府県ごとの代表的なご当地キーワードに、汎用アンカーも加えて精度を上げる
       const keywords = LOCAL_SPECIALTIES_KEYWORDS[prefecture] || [];
       if (keywords.length === 0) {
         setLoadingLocalSpecialties(false);
@@ -252,13 +466,15 @@ export default function RecommendationRankingScreen({
 
       const allResults: Place[] = [];
       
-      // 代表的なキーワード上位から検索（ヒット数と速度のバランスで最大5件）
-      for (const specialty of keywords.slice(0, 5)) {
+      // 代表的なキーワード上位 + ご当地アンカーから広めに検索（最大8ターム×各6件）
+      const anchors = ['郷土料理','名物','市場','漁港','道の駅'];
+      const terms = [...keywords.slice(0, 6), ...anchors].slice(0, 8);
+      for (const term of terms) {
         try {
-          const results = await searchPlaces(`${specialty} ${prefecture}`, loc.lat, loc.lng);
-          allResults.push(...results.slice(0, 3)); // 各キーワードから3件まで
+          const results = await searchPlaces(`${prefecture} ${term}`, loc.lat, loc.lng, { radius: 10000, max: 20 });
+          allResults.push(...results.slice(0, 6)); // 各キーワードから6件まで
         } catch (error) {
-          console.warn(`${specialty}の検索でエラー:`, error);
+          console.warn(`${term} の検索でエラー:`, error);
         }
       }
       
@@ -268,17 +484,54 @@ export default function RecommendationRankingScreen({
           index === self.findIndex(p => p.id === place.id)
         );
 
+        // ご当地限定: 県の名物/アンカーにマッチする店のみ残す
+        const strictLocal = uniqueResults.filter((p) => isLocalPlace({
+          id: p.id,
+          name: p.name,
+          lat: p.lat,
+          lng: p.lng,
+          address: p.address,
+          rating: p.rating,
+          types: p.types,
+        } as any, prefecture));
+
+        if (strictLocal.length === 0) {
+          setShowAIRanking(false);
+          setLocalSpecialties([]);
+          setMsg(`${prefecture}のご当地グルメ（その土地の名物）に該当するお店が見つかりませんでした`);
+          Alert.alert('ご当地限定', `${prefecture}の名物に該当するお店が見つかりませんでした。検索範囲を広げるか、別の名物でお試しください。`);
+          return;
+        }
+
+        // 価格レベル補完（不足分はDetailsで取得）
+        let localWithPrice = await enrichPlacesWithPriceLevel(strictLocal);
+        localWithPrice = await enrichPlacesWithHotPepperBudget(localWithPrice, loc.lat, loc.lng);
+
         // AIランキングと同様のモーダルで表示するため、AIスコアを計算してモーダルを開く
         setMsg('🍽️ ご当地グルメのスコアを計算中...');
-  const scores = await calculateAIScore(uniqueResults, loc, prefecture);
-        setAiScores(scores);
+        const scores = await calculateAIScore(
+          localWithPrice,
+          loc,
+          prefecture,
+          process.env.EXPO_PUBLIC_DEBUG_SCORING === '1',
+          { localStrict: true },
+          {
+            favoriteGenres: userPreferences.favoriteGenres || [],
+            budgetRange: mapPriceToRange(userPreferences.priceRange || '¥¥'),
+            allergies: userPreferences.dietaryRestrictions || [],
+            preferredDistance: userPreferences.preferredDistance || 0,
+          } as any
+        );
+        const top10 = scores.slice(0, 10);
+        setAiScores(top10);
   setRankingTitle(`🍽️ ${prefecture}のご当地グルメランキング`);
   setRankingDescription('ご当地度・距離・評価などを総合して並べ替えています');
   setRankingReasoningTitle('📝 おすすめ理由:');
   setShowAIRanking(true);
+  setRankingMode('local');
         setShowLocalSpecialties(false);
-        setLocalSpecialties(uniqueResults);
-        setMsg(`🍽️ ${prefecture}のご当地グルメをランキング表示しました (${scores.length}件)`);
+        setLocalSpecialties(strictLocal);
+        setMsg(`🍽️ ${prefecture}のご当地グルメ（その土地の名物のみ）Top10を表示しました (${top10.length}件)`);
       } else {
         setMsg(`${prefecture}のご当地グルメが見つかりませんでした`);
       }
@@ -322,10 +575,10 @@ export default function RecommendationRankingScreen({
       let targetPlaces: Place[] = [];
       
       try {
-        const nearbyRestaurants = await searchPlaces('レストラン', location.lat, location.lng);
+        const nearbyRestaurants = await searchPlaces('レストラン', location.lat, location.lng, { radius: 8000, max: 20 });
         if (nearbyRestaurants.length === 0) {
           // レストランが見つからない場合は飲食店で検索
-          const nearbyFood = await searchPlaces('飲食店', location.lat, location.lng);
+          const nearbyFood = await searchPlaces('飲食店', location.lat, location.lng, { radius: 8000, max: 20 });
           targetPlaces = nearbyFood;
         } else {
           targetPlaces = nearbyRestaurants;
@@ -345,14 +598,59 @@ export default function RecommendationRankingScreen({
 
       setMsg('🤖 AIが総合スコアを計算中...');
 
+      // ジャンル補完: 選択ジャンルがあるのに十分ヒットしていない場合、同義語で追加検索
+      if (userPreferences.favoriteGenres && userPreferences.favoriteGenres.length > 0) {
+        const active = userPreferences.favoriteGenres[0]; // 先頭ジャンルを代表とする
+        const synonyms = GENRE_SYNONYMS[active] || [active];
+        const minNeeded = Number(process.env.EXPO_PUBLIC_GENRE_MIN ?? '3');
+        const lowerSyns = synonyms.map(s => s.toLowerCase());
+        const currentGenreCount = targetPlaces.filter(p => {
+          const text = `${p.name || ''} ${(p.types || []).join(' ')}`.toLowerCase();
+          return lowerSyns.some(s => text.includes(s));
+        }).length;
+        if (currentGenreCount < minNeeded) {
+          const extraResults: Place[] = [];
+          for (const syn of synonyms.slice(0, 5)) { // 最大5クエリ
+            try {
+              const r = await searchPlaces(syn, location.lat, location.lng, { radius: 6000, max: 15 });
+              extraResults.push(...r);
+            } catch {}
+            if (extraResults.length + currentGenreCount >= minNeeded) break;
+          }
+          if (extraResults.length) {
+            // 既存 + 追加を重複除外
+            const merged = [...targetPlaces, ...extraResults].filter((pl, idx, arr) => idx === arr.findIndex(p => p.id === pl.id));
+            targetPlaces = merged;
+          }
+        }
+      }
+
+      // 価格レベル補完（不足分はDetailsで取得）
+      targetPlaces = await enrichPlacesWithPriceLevel(targetPlaces);
+      targetPlaces = await enrichPlacesWithHotPepperBudget(targetPlaces, location.lat, location.lng);
+
       // AIスコアリング実行
-  const scores = await calculateAIScore(targetPlaces, location, currentPrefecture);
-      setAiScores(scores);
+  const scores = await calculateAIScore(
+    targetPlaces,
+    location,
+    currentPrefecture,
+    process.env.EXPO_PUBLIC_DEBUG_SCORING === '1',
+    { localStrict: false },
+    {
+      favoriteGenres: userPreferences.favoriteGenres || [],
+      budgetRange: mapPriceToRange(userPreferences.priceRange || '¥¥'),
+      allergies: userPreferences.dietaryRestrictions || [],
+      preferredDistance: userPreferences.preferredDistance || 0
+    } as any
+  );
+      const top10 = scores.slice(0, 10);
+      setAiScores(top10);
   setRankingTitle(undefined);
   setRankingDescription(undefined);
   setRankingReasoningTitle(undefined);
       setShowAIRanking(true);
-      setMsg(`🤖 AIランキング計算完了！ ${scores.length}件を分析`);
+      setRankingMode('ai');
+      setMsg(`🤖 AIランキング計算完了！ Top10を表示中 (${top10.length}件)`);
     } catch (error) {
       console.error('AIランキング計算エラー:', error);
       Alert.alert('エラー', 'AIランキングの計算に失敗しました');
@@ -442,6 +740,7 @@ export default function RecommendationRankingScreen({
         title={rankingTitle}
         description={rankingDescription}
         reasoningTitle={rankingReasoningTitle}
+        mode={rankingMode}
       />
   </View>
   );

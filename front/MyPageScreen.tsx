@@ -10,14 +10,15 @@ import {
   Modal,
   TouchableWithoutFeedback,
   Keyboard,
+  Image,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useNavigation } from '@react-navigation/native';
 import { useAuth } from '../utils/auth';
 import { apiCall } from '../utils/api';
 
 type UserPreferences = {
   favoriteGenres: string[];
-  favoriteFoods: string[];
   priceRange: string;
   dietaryRestrictions: string[];
   preferredDistance: number;
@@ -39,15 +40,40 @@ const OPTIONS = {
 
 export default function MyPageScreen({ onClose }: Props) {
   const { user, token } = useAuth();
+  const navigation = useNavigation<any>();
   const [preferences, setPreferences] = useState<UserPreferences>({
-    favoriteGenres: [], favoriteFoods: [], priceRange: '¥¥',
+    favoriteGenres: [], priceRange: '¥¥',
     dietaryRestrictions: [], preferredDistance: 2000,
   });
   const [loading, setLoading] = useState(false);
-  const [modalType, setModalType] = useState<'genre'|'food'|'dietary'|'allergy'|null>(null);
+  const [modalType, setModalType] = useState<'genre'|'dietary'|'allergy'|null>(null);
   const [allergyDetails, setAllergyDetails] = useState('');
+  const [favorites, setFavorites] = useState<Array<any>>([]);
+  const [favLoading, setFavLoading] = useState(false);
+  const [favDeleting, setFavDeleting] = useState<string | null>(null);
+  const openFavorite = async (item: any) => {
+    try {
+      await AsyncStorage.setItem('openPlace', JSON.stringify({
+        place_id: item.place_id,
+        name: item.place_name,
+        address: item.place_address,
+        latitude: item.latitude,
+        longitude: item.longitude,
+        photo_url: item.photo_url
+      }));
+      // モーダルのクローズアニメーション後に遷移して自然に移動
+      onClose();
+      setTimeout(() => {
+        // 既存のMap画面へ自然に遷移（新しい画面は作らない）
+        navigation.navigate('Map');
+      }, 200);
+    } catch (e) {
+      Alert.alert('エラー', '地図を開く準備に失敗しました');
+    }
+  };
 
   useEffect(() => { user && loadPreferences(); }, [user]);
+  useEffect(() => { user && loadFavorites(); }, [user]);
 
   const loadPreferences = async () => {
     try {
@@ -81,7 +107,6 @@ export default function MyPageScreen({ onClose }: Props) {
         // AIスコアリング用にAsyncStorageにも保存
         const aiPreferences = {
           favoriteGenres: preferences.favoriteGenres,
-          favoriteFoods: preferences.favoriteFoods,
           budgetRange: mapPriceToRange(preferences.priceRange),
           allergies: preferences.dietaryRestrictions,
           priceWeight: 0.3,
@@ -99,6 +124,44 @@ export default function MyPageScreen({ onClose }: Props) {
       Alert.alert('エラー', 'ネットワークエラー');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadFavorites = async () => {
+    if (!user || !token) return;
+    try {
+      setFavLoading(true);
+      const res = await apiCall(`/api/favorites?type=favorite`, {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const data = await res.json();
+      if (data.success) setFavorites(data.items || []);
+    } catch (e) {
+      console.log('お気に入り取得エラー', e);
+    } finally {
+      setFavLoading(false);
+    }
+  };
+
+  const removeFavorite = async (placeId: string) => {
+    if (!user || !token) return;
+    try {
+      setFavDeleting(placeId);
+      const res = await apiCall(`/api/favorites/${encodeURIComponent(placeId)}?type=favorite`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const data = await res.json();
+      if (data.success) {
+        setFavorites(prev => prev.filter((f:any) => f.place_id !== placeId));
+      } else {
+        Alert.alert('削除エラー', data.error || 'お気に入りの削除に失敗しました');
+      }
+    } catch (e) {
+      Alert.alert('削除エラー', 'ネットワークエラー');
+    } finally {
+      setFavDeleting(null);
     }
   };
   
@@ -239,8 +302,8 @@ export default function MyPageScreen({ onClose }: Props) {
       );
     }
 
-    const data = modalType === 'genre' ? OPTIONS.genres : modalType === 'food' ? OPTIONS.foods : OPTIONS.dietary;
-    const key = modalType === 'genre' ? 'favoriteGenres' : modalType === 'food' ? 'favoriteFoods' : 'dietaryRestrictions';
+    const data = modalType === 'genre' ? OPTIONS.genres : OPTIONS.dietary;
+    const key = modalType === 'genre' ? 'favoriteGenres' : 'dietaryRestrictions';
     
     return (
       <Modal visible>
@@ -299,8 +362,45 @@ export default function MyPageScreen({ onClose }: Props) {
               <Text style={styles.userEmail}>{user.email}</Text>
             </View>
 
+            <View style={styles.section}>
+              <Text style={styles.sectionTitle}>⭐ お気に入り</Text>
+              {favLoading ? (
+                <Text style={styles.favLoading}>読み込み中...</Text>
+              ) : favorites.length===0 ? (
+                <Text style={styles.favEmpty}>まだお気に入りはありません</Text>
+              ) : (
+                <View style={styles.favList}>
+                  {favorites.map((item: any) => (
+                    <View key={`${item.place_id}-${item.list_type || 'favorite'}`} style={styles.favCard}>
+                      {item.photo_url ? (
+                        <View style={styles.favRow}>
+                          <Image source={{ uri: item.photo_url }} style={styles.favThumb} />
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.favName}>{item.place_name}</Text>
+                            {item.place_address && <Text style={styles.favAddr}>{item.place_address}</Text>}
+                          </View>
+                        </View>
+                      ) : (
+                        <Text style={styles.favName}>{item.place_name}</Text>
+                      )}
+                      {item.place_address && <Text style={styles.favAddr}>{item.place_address}</Text>}
+                      <View style={styles.favMetaRow}>
+                        {item.rating && <Text style={styles.favMeta}>★ {item.rating.toFixed ? item.rating.toFixed(1) : item.rating}</Text>}
+                        {typeof item.price_level==='number' && <Text style={styles.favMeta}>{'¥'.repeat(Math.max(1,Math.min(4,item.price_level)))}</Text>}
+                        <TouchableOpacity style={styles.favOpenBtn} onPress={()=>openFavorite(item)}>
+                          <Text style={styles.favOpenText}>地図で開く</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={[styles.favDeleteBtn, favDeleting===item.place_id && styles.favDeleteBtnDisabled]} onPress={()=>removeFavorite(item.place_id)} disabled={favDeleting===item.place_id}>
+                          <Text style={[styles.favDeleteText, favDeleting===item.place_id && styles.favDeleteTextDisabled]}>{favDeleting===item.place_id ? '削除中...' : '削除'}</Text>
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                  ))}
+                </View>
+              )}
+            </View>
+
             {renderSection('🍽️ 好きなジャンル', preferences.favoriteGenres, () => setModalType('genre'))}
-            {renderSection('🥘 好きな料理', preferences.favoriteFoods, () => setModalType('food'))}
 
             <View style={styles.section}>
               <Text style={styles.sectionTitle}>💰 希望価格帯</Text>
@@ -379,6 +479,27 @@ const styles = StyleSheet.create({
   saveButton: { backgroundColor: '#28a745', paddingVertical: 16, borderRadius: 8, marginVertical: 30, marginHorizontal: 20 },
   saveButtonDisabled: { backgroundColor: '#6c757d' },
   saveButtonText: { color: '#fff', fontSize: 18, fontWeight: 'bold', textAlign: 'center' },
+  favTabs: { flexDirection: 'row', gap: 8, marginBottom: 12 },
+  favTab: { flex: 1, paddingVertical: 10, borderRadius: 8, borderWidth: 1, borderColor: '#dee2e6', backgroundColor: '#fff', alignItems: 'center' },
+  favTabActive: { borderColor: '#007bff', backgroundColor: '#e7f3ff' },
+  favTabText: { fontSize: 14, color: '#6c757d' },
+  favTabTextActive: { color: '#007bff', fontWeight: '600' },
+  favLoading: { color: '#6c757d' },
+  favEmpty: { color: '#6c757d' },
+  favList: { gap: 8 },
+  favCard: { backgroundColor: '#fff', borderRadius: 10, borderWidth: 1, borderColor: '#e9ecef', padding: 12 },
+  favRow: { flexDirection: 'row', alignItems: 'center' },
+  favThumb: { width: 64, height: 64, borderRadius: 8, marginRight: 12, backgroundColor: '#eee' },
+  favName: { fontSize: 16, fontWeight: '600', color: '#2c3e50' },
+  favAddr: { fontSize: 13, color: '#6c757d', marginTop: 4 },
+  favMetaRow: { flexDirection: 'row', gap: 12, marginTop: 6 },
+  favMeta: { fontSize: 13, color: '#495057' },
+  favOpenBtn: { marginLeft: 'auto', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6, borderWidth: 1, borderColor: '#e9ecef', backgroundColor: '#fff' },
+  favOpenText: { fontSize: 13, color: '#007bff', fontWeight: '600' },
+  favDeleteBtn: { marginLeft: 'auto', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6, borderWidth: 1, borderColor: '#e9ecef', backgroundColor: '#fff' },
+  favDeleteBtnDisabled: { opacity: 0.6 },
+  favDeleteText: { fontSize: 13, color: '#e74c3c', fontWeight: '600' },
+  favDeleteTextDisabled: { color: '#c0392b' },
   modalContainer: { flex: 1, backgroundColor: '#f8f9fa' },
   overlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' },
   modal: { backgroundColor: '#fff', margin: 20, padding: 20, borderRadius: 12, minWidth: 300 },

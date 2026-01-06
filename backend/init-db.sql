@@ -1,5 +1,21 @@
 -- 旅先グルメアプリ用のデータベーススキーマ
--- PostgreSQL初期化スクリプト
+-- PostgreSQL初期化スクリプト（再実行可能版）
+-- 必要に応じて下の DROP セクションをコメント解除してフル初期化できます。
+-- データ消去に注意。安全に使うためデフォルトはコメントアウト。
+
+BEGIN;
+
+-- =========================
+-- 強制初期化用 DROP 実行（フル初期化）
+-- 下記のコメントを外すと既存データが消えます。今回は実行できる形に修正。
+-- 必要が無ければ再度コメントアウトしてください。
+DROP TABLE IF EXISTS favorites CASCADE;
+DROP TABLE IF EXISTS reviews CASCADE;
+DROP TABLE IF EXISTS visit_history CASCADE;
+DROP TABLE IF EXISTS user_actions CASCADE;
+DROP TABLE IF EXISTS spots_cache CASCADE;
+DROP TABLE IF EXISTS user_preferences CASCADE;
+DROP TABLE IF EXISTS users CASCADE;
 
 -- ユーザーテーブル
 CREATE TABLE IF NOT EXISTS users (
@@ -27,9 +43,10 @@ CREATE TABLE IF NOT EXISTS favorites (
     longitude DECIMAL(11, 8),
     rating DECIMAL(2, 1),
     price_level INTEGER,
-    photo_url VARCHAR(500),
+    photo_url TEXT, -- URL長が500を超えるケース対応
+    list_type VARCHAR(20) NOT NULL DEFAULT 'favorite', -- 'favorite' or 'wishlist'
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, place_id)
+    UNIQUE(user_id, place_id, list_type)
 );
 
 -- レビューテーブル
@@ -58,16 +75,6 @@ CREATE TABLE IF NOT EXISTS visit_history (
     visited_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- ユーザー行動記録テーブル（推薦システム用）
-CREATE TABLE IF NOT EXISTS user_actions (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    action_type VARCHAR(50) NOT NULL, -- 'visit', 'favorite', 'review', 'search'
-    spot_id VARCHAR(255) NOT NULL,
-    spot_name VARCHAR(255) NOT NULL,
-    metadata JSONB, -- 追加のメタデータ（評価、コメントなど）
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
 
 -- スポット情報キャッシュテーブル
 CREATE TABLE IF NOT EXISTS spots_cache (
@@ -87,19 +94,6 @@ CREATE TABLE IF NOT EXISTS spots_cache (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- ユーザー嗜好プロファイルテーブル
-CREATE TABLE IF NOT EXISTS user_preferences (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-    cuisine_preferences JSONB, -- 料理ジャンル別スコア
-    price_preferences JSONB, -- 価格帯別スコア
-    atmosphere_preferences JSONB, -- 雰囲気別スコア
-    time_preferences JSONB, -- 時間帯別スコア
-    location_preferences JSONB, -- エリア別スコア
-    last_calculated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
 
 -- ユーザー設定テーブル
 CREATE TABLE IF NOT EXISTS user_preferences (
