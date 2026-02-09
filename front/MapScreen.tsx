@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, FlatList, Modal, Alert, Keyboard, TouchableWithoutFeedback, Image, Dimensions } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, FlatList, Modal, Alert, Keyboard, TouchableWithoutFeedback, Image, Dimensions, Platform } from 'react-native';
 import MapView, { Marker, Polyline, PROVIDER_GOOGLE, Region } from 'react-native-maps';
 import * as Location from 'expo-location';
 import { getDistance } from 'geolib';
@@ -17,8 +17,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from '@react-navigation/native';
 
 const API_KEY: string = ensureGoogleApiKey();
-// Undo バー表示を無効化したい場合は false にする
-const UNDO_ENABLED = false;
+// Undo機能は使用しない（簡潔化）
 
 // 画面サイズに応じてカード/画像/下部リストのサイズを調整
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
@@ -98,26 +97,50 @@ async function getPrefectureFromCoords(lat: number, lng: number): Promise<string
   if (!API_KEY) throw new Error('Google Maps API キーが設定されていません');
 
   try {
+    // 行政区（都道府県）に結果を絞り込み、言語は日本語
     const res = await fetch(
       `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&key=${API_KEY}&language=ja&result_type=administrative_area_level_1`
     );
 
     const data = await res.json();
 
-    if (data.results && data.results.length > 0) {
-      for (const result of data.results) {
+    if (data.results?.[0]?.address_components) {
+      for (const component of data.results[0].address_components) {
+        if (component.types.includes('administrative_area_level_1')) {
+          return component.long_name;
+        }
+      }
+    }
+
+    // フォールバック: JPに限定して再試行 + locality/political から推測
+    const resFallback = await fetch(
+      `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&key=${API_KEY}&language=ja&components=country:JP`
+    );
+    const fb = await resFallback.json();
+    if (fb.results && fb.results.length > 0) {
+      for (const result of fb.results) {
         for (const component of result.address_components) {
           if (component.types.includes('administrative_area_level_1')) {
             return component.long_name;
           }
         }
       }
+      for (const result of fb.results) {
+        for (const component of result.address_components) {
+          if (component.types.includes('locality') || component.types.includes('political')) {
+            const name: string = component.long_name || component.short_name;
+            if (name && (name.endsWith('都') || name.endsWith('道') || name.endsWith('府') || name.endsWith('県'))) {
+              return name;
+            }
+          }
+        }
+      }
     }
 
-    throw new Error('都道府県が見つかりませんでした');
+    return '不明';
   } catch (error) {
     console.error('都道府県取得エラー:', error);
-    throw error;
+    return '不明';
   }
 }
 
@@ -353,11 +376,6 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
   const [me, setMe] = useState<{ lat: number; lng: number } | null>(null);
   const [query, setQuery] = useState('');
   const [places, setPlaces] = useState<Place[]>([]);
-  // Undo 用 state: 直前の places を保持して「元に戻す」を可能にする
-  const [lastPlaces, setLastPlaces] = useState<Place[] | null>(null);
-  const [lastPlacesLabel, setLastPlacesLabel] = useState<string>('');
-  const [showUndo, setShowUndo] = useState(false);
-  const undoTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [route, setRoute] = useState<RouteInfo | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [navigating, setNavigating] = useState(false);
@@ -383,10 +401,39 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
   const mapRef = useRef<MapView | null>(null);
   const navInterval = useRef<NodeJS.Timeout | null>(null);
   const locationWatcher = useRef<Location.LocationSubscription | null>(null);
+  const passiveWatcher = useRef<Location.LocationSubscription | null>(null);
   const autoStartNavRef = useRef<boolean>(false);
   const lastMeRef = useRef<{ lat: number; lng: number } | null>(null);
   const prevMeRef = useRef<{ lat: number; lng: number } | null>(null);
-  const [courseHeading, setCourseHeading] = useState<number | null>(null);
+  // コース方位の上書きは使用しない
+
+  // 共通: placesを更新（必要なら選択もクリア）
+  const applyPlacesWithUndo = (
+    newPlaces: Place[],
+    _label: string,
+    opts: { clearSelection?: boolean } = {}
+  ) => {
+    const { clearSelection = true } = opts;
+    setPlaces(newPlaces);
+    if (clearSelection) setSelectedPlace(null);
+  };
+
+  // 共通: ルートと選択をクリア
+  const clearRouteAndSelection = () => {
+    setRoute(null);
+    setSelectedPlace(null);
+  };
+
+  // 共通: ルート全体が収まるようにフィット
+  const fitRoute = (coords?: { latitude: number; longitude: number }[]) => {
+    if (!coords || !coords.length || !mapRef.current) return;
+    try {
+      mapRef.current.fitToCoordinates(coords, {
+        edgePadding: { top: 80, bottom: 220, left: 40, right: 40 },
+        animated: true,
+      });
+    } catch {}
+  };
 
   // 選択中スポットの写真が未取得なら取得して反映
   useEffect(() => {
@@ -518,8 +565,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
             ? h.trueHeading
             : (typeof h.magHeading === 'number' ? h.magHeading : deviceHeading);
           const normalized = ((deg % 360) + 360) % 360;
-          // 進行方向が明確（移動ベクトルが有意）ならそれを優先
-          setDeviceHeading(courseHeading != null ? courseHeading : normalized);
+          setDeviceHeading(normalized);
         });
       } catch {
         // フォールバック：Magnetometer を使用
@@ -527,7 +573,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
           const { x, y } = data;
           let angle = Math.atan2(y, x) * (180 / Math.PI);
           angle = (angle + 360) % 360;
-          setDeviceHeading(courseHeading != null ? courseHeading : angle);
+          setDeviceHeading(angle);
         });
         Magnetometer.setUpdateInterval(300);
         headingSub = {
@@ -544,6 +590,16 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
   useEffect(() => {
     (async () => {
       try {
+        // WebではGeolocationのポリフィルを導入
+        try { if (Platform.OS === 'web') Location.installWebGeolocationPolyfill?.(); } catch {}
+
+        // 位置情報サービスが有効か確認
+        const servicesEnabled = await Location.hasServicesEnabledAsync();
+        if (!servicesEnabled) {
+          setMsg('端末の位置情報サービスがオフです。設定で有効にしてください');
+          return;
+        }
+
         const { status } = await Location.requestForegroundPermissionsAsync();
         if (status !== 'granted') {
           setMsg('位置情報の許可が必要です');
@@ -576,14 +632,40 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
             console.error('都道府県取得失敗:', error);
           }
         } else {
-
-          setMsg('⚠️ 位置情報の取得に失敗しました');
+          setMsg('⚠️ 位置情報の取得に失敗しました。周辺を測位中...');
         }
+
+        // パッシブな位置情報ウォッチを開始（ナビ中は別ウォッチを使用）
+        try {
+          passiveWatcher.current = await Location.watchPositionAsync(
+            {
+              accuracy: Location.Accuracy.Balanced,
+              distanceInterval: 10,
+              timeInterval: 5000,
+            },
+            (pos) => {
+              const { latitude, longitude } = pos.coords || ({} as any);
+              if (typeof latitude === 'number' && typeof longitude === 'number') {
+                setMe({ lat: latitude, lng: longitude });
+                setRegion((r) => ({
+                  latitude,
+                  longitude,
+                  latitudeDelta: r?.latitudeDelta ?? 0.01,
+                  longitudeDelta: r?.longitudeDelta ?? 0.01,
+                }));
+              }
+            }
+          );
+        } catch {}
       } catch (err) {
         console.error('位置情報取得エラー:', err);
         setMsg('位置情報の取得に失敗しました');
       }
     })();
+    return () => {
+      try { passiveWatcher.current?.remove?.(); } catch {}
+      passiveWatcher.current = null;
+    };
   }, []);
 
   // --- ユーザー設定取得 ---
@@ -654,16 +736,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
 
       const results = await searchPlaces(query, currentLocation.lat, currentLocation.lng);
       // places を更新（undo 対応）
-      const prev = places;
-      setLastPlaces(prev);
-      setLastPlacesLabel('検索結果');
-      setPlaces(results);
-      setSelectedPlace(null);
-      if (UNDO_ENABLED) {
-        setShowUndo(true);
-        if (undoTimerRef.current) clearTimeout(undoTimerRef.current as any);
-        undoTimerRef.current = setTimeout(() => setShowUndo(false), 6000);
-      }
+      applyPlacesWithUndo(results, '検索結果');
       setMsg('');
     } catch (e: any) {
       setMsg(e.message);
@@ -677,16 +750,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
     // 検索テキストが空になったら経路とスポットをクリア
     if (!text.trim()) {
       // クリアは undo 可能にする
-      const prev = places;
-      setLastPlaces(prev);
-      setLastPlacesLabel('検索クリア');
-      setPlaces([]);
-      setSelectedPlace(null);
-      if (UNDO_ENABLED) {
-        setShowUndo(true);
-        if (undoTimerRef.current) clearTimeout(undoTimerRef.current as any);
-        undoTimerRef.current = setTimeout(() => setShowUndo(false), 6000);
-      }
+      applyPlacesWithUndo([], '検索クリア');
       setRoute(null);
 
       // 案内中だった場合は案内も停止
@@ -708,8 +772,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
     // 案内中なら一旦停止
     if (navigating) {
       stopNavigation();
-      setRoute(null);
-      setSelectedPlace(null);
+      clearRouteAndSelection();
     }
 
     const specialties = LOCAL_SPECIALTIES[currentPrefecture];
@@ -759,17 +822,8 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         );
 
         // 通常検索と同じ横スライド一覧で表示（下部リスト）
-        const prev = places;
-        setLastPlaces(prev);
-        setLastPlacesLabel('ご当地グルメ');
-        setPlaces(enriched);
-        setSelectedPlace(null);
+        applyPlacesWithUndo(enriched, 'ご当地グルメ');
         setShowLocalSpecialties(false);
-        if (UNDO_ENABLED) {
-          setShowUndo(true);
-          if (undoTimerRef.current) clearTimeout(undoTimerRef.current as any);
-          undoTimerRef.current = setTimeout(() => setShowUndo(false), 6000);
-        }
         setMsg(`🍽️ ${currentPrefecture}のご当地グルメ ${enriched.length}件を表示中`);
       } else {
         setMsg(`${currentPrefecture}のご当地グルメが見つかりませんでした`);
@@ -834,14 +888,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
           }
 
           // 検索結果をmapに表示（undo 対応）
-          setLastPlaces(places);
-          setLastPlacesLabel('周辺検索');
-          setPlaces(targetPlaces);
-          if (UNDO_ENABLED) {
-            setShowUndo(true);
-            if (undoTimerRef.current) clearTimeout(undoTimerRef.current as any);
-            undoTimerRef.current = setTimeout(() => setShowUndo(false), 6000);
-          }
+          applyPlacesWithUndo(targetPlaces, '周辺検索', { clearSelection: false });
         } catch (searchError) {
           console.error('周辺レストラン検索エラー:', searchError);
           Alert.alert('エラー', '周辺のレストラン検索に失敗しました');
@@ -977,10 +1024,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         }));
 
         setRecommendedSpots(spots);
-        // undo 対応
-        setLastPlaces(places);
-        setLastPlacesLabel('おすすめ取得');
-        setPlaces(spots); // マップ上に表示
+        applyPlacesWithUndo(spots, 'おすすめ取得', { clearSelection: false });
         setShowRecommendedList(true); // リスト表示
 
         setMsg(`🎯 あなたの好みに基づく${spots.length}件のおすすめスポットを表示中`);
@@ -1020,15 +1064,8 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
       setPlaces([p]);
       const r = await computeRoute(origin, { lat: p.lat, lng: p.lng }, travelMode);
       setRoute(r);
-      // ルート全体が収まるようにフィットして、現在地アイコンも画面内に入れる
-      if (mapRef.current && r?.coords?.length) {
-        try {
-          mapRef.current.fitToCoordinates(r.coords, {
-            edgePadding: { top: 80, bottom: 220, left: 40, right: 40 },
-            animated: true,
-          });
-        } catch {}
-      }
+      // ルート全体が収まるようにフィット
+      fitRoute(r?.coords);
       setMsg(null);
       return r;
     } catch (e: any) {
@@ -1064,6 +1101,9 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
         setMe({ lat: initPos.coords.latitude, lng: initPos.coords.longitude });
       }
     } catch {}
+    // ナビ中はパッシブウォッチを停止
+    try { passiveWatcher.current?.remove?.(); } catch {}
+    passiveWatcher.current = null;
     setNavigating(true);
     setMsg('🚶 案内を開始しました');
     // 初期進捗リセット
@@ -1152,10 +1192,8 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
     setRemainingDurationSec(null);
     // 検索欄もクリア
     setQuery('');
-    // スポットをクリア（undo 対応）
-    setLastPlaces(places);
-    setLastPlacesLabel('案内終了でクリア');
-    setPlaces([]); // スポットもクリア
+    // スポットをクリア
+    setPlaces([]);
     setSelectedPlace(null);
 
     // 現在地を確実に保持
@@ -1165,6 +1203,29 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
     }
 
     setMsg('🚫 案内を終了しました');
+
+    // ナビ終了後にパッシブウォッチを再開
+    try {
+      passiveWatcher.current = await Location.watchPositionAsync(
+        {
+          accuracy: Location.Accuracy.Balanced,
+          distanceInterval: 10,
+          timeInterval: 5000,
+        },
+        (pos) => {
+          const { latitude, longitude } = pos.coords || ({} as any);
+          if (typeof latitude === 'number' && typeof longitude === 'number') {
+            setMe({ lat: latitude, lng: longitude });
+            setRegion((r) => ({
+              latitude,
+              longitude,
+              latitudeDelta: r?.latitudeDelta ?? 0.01,
+              longitudeDelta: r?.longitudeDelta ?? 0.01,
+            }));
+          }
+        }
+      );
+    } catch {}
 
     // 追加で現在地を再取得（バックアップ）
     setTimeout(async () => {
@@ -1241,14 +1302,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
           latitudeDelta: 0.01,
           longitudeDelta: 0.01,
         });
-        if (r?.coords?.length) {
-          try {
-            mapRef.current.fitToCoordinates(r.coords, {
-              edgePadding: { top: 80, bottom: 220, left: 40, right: 40 },
-              animated: true,
-            });
-          } catch {}
-        }
+        fitRoute(r?.coords);
       }
       return true;
     } catch (e) {
@@ -1321,14 +1375,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
               longitudeDelta: 0.01,
             });
             // ルートのポリライン全体が収まるようにフィット
-            if (routeInfo?.coords?.length) {
-              try {
-                mapRef.current.fitToCoordinates(routeInfo.coords, {
-                  edgePadding: { top: 80, bottom: 220, left: 40, right: 40 },
-                  animated: true,
-                });
-              } catch {}
-            }
+            fitRoute(routeInfo?.coords);
           }
         } catch (e) {
           // 失敗しても画面クラッシュしないように
@@ -1361,10 +1408,8 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
       rating: spot.rating
     };
 
-    // 推薦からスポットを選択して表示（undo 対応）
-    setLastPlaces(places);
-    setLastPlacesLabel('推薦で選択');
-    setPlaces([newPlace]);
+    // 推薦からスポットを選択して表示
+    applyPlacesWithUndo([newPlace], '推薦で選択');
 
     // 地図の中心を移動
     setRegion({
@@ -1378,23 +1423,7 @@ export default function MapScreen({ navigation }: { navigation?: any }) {
     drawRoute(newPlace);
   };
 
-  // --- 元に戻す（undo）処理 ---
-  const handleUndo = () => {
-    if (!lastPlaces) {
-      setShowUndo(false);
-      return;
-    }
-    setPlaces(lastPlaces);
-    setLastPlaces(null);
-    setLastPlacesLabel('');
-    setShowUndo(false);
-    if (undoTimerRef.current) {
-      clearTimeout(undoTimerRef.current as any);
-      undoTimerRef.current = null;
-    }
-    setMsg('操作を元に戻しました');
-    setTimeout(() => setMsg(''), 2000);
-  };
+  // Undo機能は削除
 
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
@@ -1877,13 +1906,7 @@ const styles = StyleSheet.create({
   saveRow: { flexDirection: 'row', alignSelf: 'flex-end', gap: 6, marginTop: 6, marginBottom: 2 },
   saveBtn: { width: 28, height: 28, borderRadius: 7, justifyContent: 'center', alignItems: 'center' },
   saveIcon: { color: '#fff', fontSize: 13, fontWeight: '700' },
-  locationBtn: {
-    position: 'absolute', bottom: 120, right: 20,
-    width: 50, height: 50, backgroundColor: '#007AFF',
-    borderRadius: 25, justifyContent: 'center', alignItems: 'center',
-    shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 8, elevation: 8, zIndex: 10,
-  },
-  locationBtnText: { fontSize: 22, color: 'white' },
+  // 旧: 単独の現在地ボタンは非使用（fab群に統合）
   // 浮遊ボタンコンテナ
   floatingControls: {
     position: 'absolute',
@@ -1909,47 +1932,9 @@ const styles = StyleSheet.create({
     elevation: 6,
   },
   fabIcon: { fontSize: 22, color: 'white' },
-  recommendationBtn: {
-    position: 'absolute', bottom: 190, right: 20,
-    width: 50, height: 50, backgroundColor: '#FF9500',
-    borderRadius: 25, justifyContent: 'center', alignItems: 'center',
-    shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 8, elevation: 8, zIndex: 10,
-  },
-  recommendationBtnText: { fontSize: 22, color: 'white' },
-  localSpecialtyBtn: {
-    position: 'absolute', bottom: 260, right: 20,
-    width: 50, height: 50, backgroundColor: '#E74C3C',
-    borderRadius: 25, justifyContent: 'center', alignItems: 'center',
-    shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 8, elevation: 8, zIndex: 10,
-  },
   localSpecialtyLabel: {
     fontSize: 22, color: 'white', fontWeight: '600', marginTop: 0
   },
-  aiRankingBtn: {
-    position: 'absolute', bottom: 330, right: 20,
-    width: 50, height: 50, backgroundColor: '#9C27B0',
-    borderRadius: 25, justifyContent: 'center', alignItems: 'center',
-    shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 8, elevation: 8, zIndex: 10,
-  },
-  aiRankingBtnText: {
-    fontSize: 22, color: 'white', fontWeight: '600'
-  },
-  recommendationRankingBtn: {
-    position: 'absolute', bottom: 400, right: 20,
-    width: 50, height: 50, backgroundColor: '#FF6B35',
-    borderRadius: 25, justifyContent: 'center', alignItems: 'center',
-    shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 8, elevation: 8, zIndex: 10,
-  },
-  recommendationRankingBtnText: {
-    fontSize: 22, color: 'white', fontWeight: '600'
-  },
-  myPageBtn: {
-    position: 'absolute', bottom: 470, right: 20,
-    width: 50, height: 50, backgroundColor: '#6C5CE7',
-    borderRadius: 25, justifyContent: 'center', alignItems: 'center',
-    shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 8, elevation: 8, zIndex: 10,
-  },
-  myPageBtnText: { fontSize: 22, color: 'white' },
   modalContainer: { flex: 1, backgroundColor: '#fff' },
   modalHeader: {
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
@@ -1958,27 +1943,7 @@ const styles = StyleSheet.create({
   modalTitle: { fontSize: 20, fontWeight: '700', color: '#1a1a1a' },
   closeBtn: { padding: 8 },
   closeBtnText: { fontSize: 18, color: '#6c757d' },
-  // 元に戻すバー
-  undoBar: {
-    position: 'absolute',
-    bottom: 110,
-    left: 16,
-    right: 16,
-    zIndex: 30,
-    backgroundColor: '#fff',
-    borderRadius: 8,
-    padding: 10,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    shadowColor: '#000',
-    shadowOpacity: 0.15,
-    shadowRadius: 6,
-    elevation: 4,
-  },
-  undoText: { color: '#333', fontSize: 14, flex: 1, marginRight: 10 },
-  undoBtn: { backgroundColor: '#FF6B35', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 6 },
-  undoBtnText: { color: '#fff', fontWeight: '700' },
+  // Undoバーは非使用
 
   // おすすめスポットリスト用スタイル
   recommendedListContainer: {
@@ -2130,40 +2095,5 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 20,
   },
-  // 新: 下部アクションバー
-  actionRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-around',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    marginTop: 8,
-  },
-  actionBtn: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
-    justifyContent: 'center',
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOpacity: 0.15,
-    shadowRadius: 4,
-    elevation: 4,
-  },
-
-  actionIcon: { fontSize: 22, color: '#fff', fontWeight: '600' },
-  actionLabelOverlay: {
-    position: 'absolute',
-    top: -16,
-    left: '50%',
-    transform: [{ translateX: -20 }],
-    backgroundColor: 'rgba(0,0,0,0.55)',
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 12,
-    color: '#fff',
-    fontSize: 11,
-    fontWeight: '600',
-    overflow: 'hidden',
-  },
+  // 下部アクションバーは非使用
 });

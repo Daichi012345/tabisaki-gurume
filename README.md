@@ -1,4 +1,4 @@
-# 旅先グルメアプリ
+# 旅先グルメグリ
 
 React Native ExpoとGoogle Maps APIを使用した、レストラン検索・経路案内アプリです。
 
@@ -39,13 +39,6 @@ React Native ExpoとGoogle Maps APIを使用した、レストラン検索・経
 - **Places API (New)**: 新世代のレストラン情報・検索機能
 - **Routes API (New)**: 新世代の経路計算・案内機能
 - **Geocoding API**: 住所⇔座標変換（従来API継続使用）
-
-### ⚠️ 重要な変更点
-このアプリは**新しいGoogle Maps Platform API**を使用しています：
-- Places API (New) - `places.googleapis.com/v1`
-- Routes API (New) - `routes.googleapis.com/directions/v2`
-
-従来のAPIは段階的に廃止されるため、これらの新しいAPIが有効化されている必要があります。
 
 ## 技術スタック
 
@@ -102,12 +95,3 @@ npx expo run:ios
 
 `.env`ファイルとapp.jsonにGoogle Maps APIキーが設定済みです。
 本番環境では適切なAPI制限・課金設定を行ってください。
-
-## 今後の拡張予定
-
-- [ ] お気に入り機能
-- [ ] レビュー投稿機能
-- [ ] ソーシャル共有機能
-- [ ] オフライン地図機能
-- [ ] プッシュ通知
-- [ ] 多言語対応
